@@ -1,0 +1,133 @@
+# pages/06b_Log_Mental.py
+import time, json
+from datetime import datetime, timezone, date
+from zoneinfo import ZoneInfo
+
+import streamlit as st
+from httpx import ReadError
+from supabase import create_client
+
+from nav import top_nav
+from services.memory import embed_text
+
+# ---------- Page config ----------
+st.set_page_config(page_title="Log Mental - Health Whisperer",
+                   layout="wide",
+                   initial_sidebar_state="collapsed")
+st.markdown("""
+<style>
+  section[data-testid='stSidebarNav']{display:none;}
+  .soft { background: linear-gradient(180deg, rgba(250,250,250,.95), rgba(245,245,245,.9)); border:1px solid rgba(0,0,0,.06); border-radius: 12px; padding: 12px 14px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- Retry helper ----------
+def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
+    for i in range(tries):
+        try:
+            return req.execute()
+        except Exception as e:
+            msg = str(e)
+            if "10035" in msg or isinstance(e, ReadError):
+                time.sleep(base_delay * (i + 1))
+                continue
+            raise
+    return req.execute()
+
+# ---------- Supabase client ----------
+@st.cache_resource
+def get_sb():
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["key"]
+    return create_client(url, key)
+sb = get_sb()
+
+# ---------- Navbar / Auth ----------
+def on_sign_out():
+    sb.auth.sign_out()
+    st.session_state.pop("sb_session", None)
+
+is_authed = "sb_session" in st.session_state
+top_nav(is_authed, on_sign_out, current="Log Mental")
+if not is_authed:
+    st.warning("Please sign in first.")
+    st.switch_page("pages/02_Sign_In.py")
+    st.stop()
+
+uid = st.session_state["sb_session"]["user_id"]
+
+# ---------- Helpers ----------
+def _user_tz(uid: str) -> ZoneInfo:
+    try:
+        r = exec_with_retry(sb.table("hw_preferences").select("tz").eq("uid", uid).maybe_single())
+        tz = (r.data or {}).get("tz") or "America/New_York"
+    except Exception:
+        tz = "America/New_York"
+    try:
+        return ZoneInfo(tz)
+    except Exception:
+        return ZoneInfo("America/New_York")
+
+def _today(uid: str) -> date:
+    return datetime.now(timezone.utc).astimezone(_user_tz(uid)).date()
+
+def _get_today_manual(uid: str) -> dict:
+    t = _today(uid).isoformat()
+    req = (sb.table("hw_metrics").select("*")
+           .eq("uid", uid).eq("source", "manual").eq("log_date", t)
+           .limit(1))
+    r = exec_with_retry(req)
+    return (r.data[0] if r.data else {}) or {}
+
+today_row = _get_today_manual(uid)
+
+st.title("🧠 Log Mental Well-being")
+st.caption("Mood, stress, anxiety, focus & quick journaling — saved to today’s manual metrics, plus optional journal table for RAG.")
+
+c1, c2, c3, c4 = st.columns(4)
+mood   = c1.slider("Mood (1–5)",    1, 5, int(today_row.get("mood") or 3))
+stress = c2.slider("Stress (1–5)",  1, 5, int(today_row.get("stress_level") or 3))
+anx    = c3.slider("Anxiety (1–5)", 1, 5, int(today_row.get("anxiety_level") or 2))
+focus  = c4.slider("Focus (1–5)",   1, 5, int(today_row.get("focus_level") or 3))
+
+cbt_tag = st.selectbox("Quick CBT tag (optional)", ["", "reframe", "gratitude", "exposure", "journaling", "mindfulness"])
+journal = st.text_area("Journal", value=today_row.get("journal") or "", height=180,
+                       placeholder="Free-write—what’s on your mind?")
+
+with st.expander("Tips", expanded=False):
+    st.write("• Keep entries short but concrete (what happened, feelings, what you did).")
+    st.write("• Use tags to cluster similar entries later (‘gratitude’, ‘work’, ‘sleep’).")
+
+if st.button("💾 Save Mental"):
+    # 1) Save into today’s manual metrics row
+    payload = {
+        "uid": uid,
+        "source": "manual",
+        "log_date": _today(uid).isoformat(),
+        "mood": int(mood),
+        "stress_level": int(stress),
+        "anxiety_level": int(anx),
+        "focus_level": int(focus),
+        "journal": journal or None,
+        "journal_tag": (cbt_tag or None),
+    }
+    try:
+        sb.table("hw_metrics").upsert(payload, on_conflict="uid,source,log_date").execute()
+    except Exception:
+        exec_with_retry(sb.table("hw_metrics").insert(payload))
+
+    # 2) Also append to a dedicated hw_journal table for RAG (NOW with embedding)
+    try:
+        emb = embed_text(journal) if (journal and journal.strip()) else None
+        sb.table("hw_journal").insert({
+            "uid": uid,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "text": journal or "",
+            "tags": [cbt_tag] if cbt_tag else [],
+            "embedding": emb
+        }).execute()
+    except Exception:
+        pass  # table might not exist yet; safe to ignore
+
+    st.success("Mental well-being saved for today.")
+    today_row = _get_today_manual(uid)
