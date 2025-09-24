@@ -1,12 +1,12 @@
 # services/nutrition_llm.py
 from __future__ import annotations
-
+from supa import get_sb
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-# Reuse your OpenAI helpers (lazy import + secrets handling)
+# Reuse your OpenAI helpers (lazy import + secrets )
 from services.llm_openai import chat_json, embed_text  # :contentReference[oaicite:2]{index=2}
 
 # Supabase + Streamlit are optional at import-time to avoid hard crashes
@@ -109,101 +109,130 @@ def estimate_meal(text: str) -> Dict[str, Any]:
     return {"items": items, "totals": totals}
 
 
+def build_blurb(raw_text: str, parsed: Dict[str, Any]) -> str:
+    its = (parsed or {}).get("items") or []
+    tot = (parsed or {}).get("totals") or {}
+    parts = []
+    # left: quick human summary
+    if tot:
+        cal = tot.get("calories")
+        p = tot.get("protein_g"); c = tot.get("carbs_g"); f = tot.get("fat_g")
+        macro = " · ".join(
+            [f"{int(cal)} kcal" if cal else "kcal ?",
+             f"P {int(p)}g" if p is not None else "P ?",
+             f"C {int(c)}g" if c is not None else "C ?",
+             f"F {int(f)}g" if f is not None else "F ?"]
+        )
+        parts.append(macro)
+    # right: first 2 items, if any
+    if its:
+        names = [str((it or {}).get("name") or "").strip() for it in its]
+        names = [n for n in names if n][:2]
+        if names:
+            parts.append(" • " + ", ".join(names))
+    # fallback to raw text if nothing else
+    if not parts:
+        parts = [raw_text.strip()[:120]]
+    return " — ".join(parts)
+
+def _num_or_none(x):
+    try:
+        if x is None: return None
+        if isinstance(x, (int, float)): return float(x)
+        s = str(x).strip()
+        if s == "" or s.lower() in {"none","null","nan"}: return None
+        return float(s)
+    except Exception:
+        return None
+
+def _to_int(x: Optional[float]) -> Optional[int]:
+    if x is None: return None
+    try:
+        return int(round(float(x)))
+    except Exception:
+        return None
+
 def save_meal(
     uid: str,
     raw_text: str,
     parsed: Dict[str, Any],
     when_utc: Optional[datetime],
     meal_type: str,
+    access_token: str,
 ) -> None:
-    """
-    Inserts a meal into hw_meals with best-available fields,
-    and (optionally) an embedding of a concise blurb for retrieval.
-    """
-    ts = when_utc or datetime.now(timezone.utc)
+    sb = get_sb(access_token)
 
-    # Extract totals
-    totals = parsed.get("totals") or {}
-    calories = _to_int(_num_or_none(totals.get("calories")))
-    protein_g = _num_or_none(totals.get("protein_g"))
-    carbs_g   = _num_or_none(totals.get("carbs_g"))
-    fat_g     = _num_or_none(totals.get("fat_g"))
-    sodium_mg = _num_or_none(totals.get("sodium_mg"))
-    sugar_g   = _num_or_none(totals.get("sugar_g"))
-
-    # Build a compact factual blurb for retrieval (RAG)
-    items_preview = "; ".join(
-        f"{(it.get('name') or '').strip()}"
-        + (f" ({it.get('portion')})" if it.get("portion") else "")
-        for it in (parsed.get("items") or [])
-        if it.get("name")
-    )
-    blurb = (
-        f"{meal_type.title()} • {items_preview or raw_text} "
-        f"→ kcal {calories if calories is not None else 'unk'}; "
-        f"P {fmt_num(protein_g)}g; C {fmt_num(carbs_g)}g; F {fmt_num(fat_g)}g; "
-        f"Na {fmt_num(sodium_mg)}mg; Sug {fmt_num(sugar_g)}g"
-    )
-
-    # Try to embed the blurb
-    embedding: Optional[List[float]] = None
-    try:
-        embedding = embed_text(blurb)  # 1536-d vector  :contentReference[oaicite:4]{index=4}
-    except Exception:
-        # If embedding fails (missing key, offline, etc.), continue without it
-        embedding = None
+    totals = (parsed or {}).get("totals") or {}
+    blurb = build_blurb(raw_text, parsed)
 
     payload = {
         "uid": uid,
-        "ts": ts.isoformat(),
+        "ts": (when_utc or datetime.now(timezone.utc)).isoformat(),
         "meal_type": meal_type,
         "items": raw_text,
-        "calories": calories,
-        "protein_g": protein_g,
-        "carbs_g": carbs_g,
-        "fat_g": fat_g,
-        "sodium_mg": sodium_mg,
-        "sugar_g": sugar_g,
-        "parsed": parsed,       # if you created a JSONB column, this will land there
-        "blurb": blurb,         # if you added a text column for display
-        "embedding": embedding, # if you added a vector column (optional)
+
+        # integer macro columns as per your schema
+        "calories":  _to_int(_num_or_none(totals.get("calories"))),
+        "protein_g": _to_int(_num_or_none(totals.get("protein_g"))),
+        "carbs_g":   _to_int(_num_or_none(totals.get("carbs_g"))),
+        "fat_g":     _to_int(_num_or_none(totals.get("fat_g"))),
+        "sugar_g":   _to_int(_num_or_none(totals.get("sugar_g"))),
+        "sodium_mg": _to_int(_num_or_none(totals.get("sodium_mg"))),
+
+        # new rich fields (will be ignored if column missing)
+        "blurb": blurb,
+        "items_json": (parsed or {}).get("items"),
+        "parsed": parsed,
     }
 
-    # Remove None so we don't trip NOT NULL / type casting
+    # add embedding only if the column exists
+    try:
+        payload["embedding"] = embed_text(blurb or raw_text)
+    except Exception:
+        # If embed model not configured, skip silently
+        payload.pop("embedding", None)
+
     clean = {k: v for k, v in payload.items() if v is not None}
+    sb.table("hw_meals").insert(clean).execute()
 
-    # Insert with a retry that drops 'embedding' if schema doesn't have it yet
-    sb = _sb()
-    try:
-        sb.table("hw_meals").insert(clean).execute()
-    except Exception as e:
-        if "embedding" in clean:
-            clean.pop("embedding", None)
-            sb.table("hw_meals").insert(clean).execute()
-        else:
-            raise
+def parse_and_log(
+    uid: str,
+    raw_text: str,
+    meal_type_hint: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper:
+      1) estimate_meal(raw_text)
+      2) choose meal_type (hint > parsed > 'snacks')
+      3) save_meal(...) with the SAME user token for RLS
 
+    Returns a small dict you can echo to UI.
+    """
+    if access_token is None:
+        raise ValueError("parse_and_log requires access_token to satisfy RLS")
 
-# ---------- Helpers ----------
+    # Use your existing estimator (keep its implementation unchanged elsewhere in this file)
+    parsed = estimate_meal(raw_text)  # noqa: F821 (exists in this module)
 
-def _num_or_none(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            return float(x)
-        s = str(x).strip()
-        return float(s) if s not in ("", "null", "None") else None
-    except Exception:
-        return None
+    mt = meal_type_hint or (
+        parsed.get("meal_type") if isinstance(parsed, dict) else None
+    ) or "snacks"
 
-def fmt_num(x: Optional[float]) -> str:
-    if x is None:
-        return "unk"
-    try:
-        # show as integer if close to whole number, else 1 decimal
-        if abs(x - round(x)) < 0.05:
-            return str(int(round(x)))
-        return f"{x:.1f}"
-    except Exception:
-        return "unk"
+    when_u = datetime.now(timezone.utc)
+    save_meal(
+        uid=uid,
+        raw_text=raw_text,
+        parsed=parsed,
+        when_utc=when_u,
+        meal_type=mt,
+        access_token=access_token,
+    )
+
+    return {
+        "saved": {
+            "uid": uid,
+            "meal_type": mt,
+            **(parsed.get("totals") or {}),
+        }
+    }

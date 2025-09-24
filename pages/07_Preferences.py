@@ -1,248 +1,258 @@
 # pages/07_Preferences.py
 import time
-from datetime import datetime, time as dt_time, timezone
-from zoneinfo import ZoneInfo
-
+from datetime import datetime, timezone
+from datetime import datetime as dt
 import streamlit as st
-import pandas as pd
-from supabase import create_client
-from httpx import ReadError
+from postgrest.exceptions import APIError
 
 from nav import top_nav
+from supa import get_sb  # same helper used by Log Nutrition
 
-# ================= Page config =================
 st.set_page_config(page_title="Preferences - Health Whisperer",
-                   layout="wide",
+                   layout="centered",
                    initial_sidebar_state="collapsed")
-st.markdown("<style>section[data-testid='stSidebarNav']{display:none;}</style>", unsafe_allow_html=True)
 
-# ================= Helpers =================
-def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
-    for i in range(tries):
-        try:
-            return req.execute()
-        except Exception as e:
-            msg = str(e)
-            if "10035" in msg or isinstance(e, ReadError):
-                time.sleep(base_delay * (i + 1))
-                continue
-            raise
-    return req.execute()
+# ---------------------------
+# Small CSS (optional)
+# ---------------------------
+st.markdown("""
+<style>
+  section[data-testid='stSidebarNav']{display:none;}
+  .soft { background: linear-gradient(180deg, rgba(250,250,250,.95), rgba(245,245,245,.9));
+          border:1px solid rgba(0,0,0,.06); border-radius: 12px; padding: 12px 14px; }
+</style>
+""", unsafe_allow_html=True)
 
-@st.cache_resource
-def get_sb():
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["key"]
-    return create_client(url, key)
-
-sb = get_sb()
-
-def _user_tz(uid: str) -> ZoneInfo:
-    try:
-        r = exec_with_retry(sb.table("hw_preferences").select("tz").eq("uid", uid).maybe_single())
-        tz = (r.data or {}).get("tz") or "America/New_York"
-    except Exception:
-        tz = "America/New_York"
-    try:
-        return ZoneInfo(tz)
-    except Exception:
-        return ZoneInfo("America/New_York")
-
-def _time_to_str(t: dt_time | None) -> str:
-    if not t: return "22:00"
-    return f"{t.hour:02d}:{t.minute:02d}"
-
-def _str_to_time(s: str | None, fallback: str) -> dt_time:
-    s = (s or fallback or "22:00").strip()
-    try:
-        hh, mm = s.split(":")[:2]
-        return dt_time(int(hh), int(mm))
-    except Exception:
-        # fallback if stored as "22:00:00"
-        try:
-            hh, mm, _ss = s.split(":")[:3]
-            return dt_time(int(hh), int(mm))
-        except Exception:
-            return dt_time(22, 0)
-
-# ================= Auth / Nav =================
+# ---------------------------
+# Navbar & Auth gate
+# ---------------------------
 def on_sign_out():
-    sb.auth.sign_out()
+    get_sb().auth.sign_out()     # sign out the SDK session
     st.session_state.pop("sb_session", None)
 
 is_authed = "sb_session" in st.session_state
 top_nav(is_authed, on_sign_out, current="Preferences")
+
 if not is_authed:
     st.warning("Please sign in first.")
     st.switch_page("pages/02_Sign_In.py")
     st.stop()
 
 uid = st.session_state["sb_session"]["user_id"]
+access_token = st.session_state["sb_session"]["access_token"]
 
-# ================= Load current prefs =================
-pref_row = {}
-try:
-    r = exec_with_retry(sb.table("hw_preferences").select("*").eq("uid", uid).maybe_single())
-    pref_row = r.data or {}
-except Exception:
-    pref_row = {}
+# Build authed client (critical for RLS), mirroring Log Nutrition
+sb = get_sb(access_token)
 
-st.title("Nudge Preferences")
+# ---------------------------
+# Helpers
+# ---------------------------
+def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
+    for i in range(tries):
+        try:
+            return req.execute()
+        except APIError as e:
+            if "PGRST303" in str(e) or "JWT expired" in str(e):
+                st.error("Your session expired. Please sign in again.")
+                on_sign_out()
+                st.switch_page("pages/02_Sign_In.py")
+                st.stop()
+            time.sleep(base_delay * (i + 1))
+        except Exception:
+            time.sleep(base_delay * (i + 1))
+    return req.execute()
 
-# ================= Sections =================
-c1, c2, c3 = st.columns(3)
+def ensure_hw_user(uid_: str):
+    exec_with_retry(sb.table("hw_users").upsert({"uid": uid_}))
 
-# Channel
-nudge_channel = c1.selectbox(
-    "Channel",
-    ["telegram", "inapp"],
-    index=(["telegram", "inapp"].index(pref_row.get("nudge_channel", "telegram"))
-           if pref_row.get("nudge_channel") in ["telegram", "inapp"] else 0)
-)
-
-# Cadence
-nudge_cadence = c2.selectbox(
-    "Cadence",
-    ["smart", "hourly", "3_per_day"],
-    index=(["smart", "hourly", "3_per_day"].index(pref_row.get("nudge_cadence", "smart"))
-           if pref_row.get("nudge_cadence") in ["smart", "hourly", "3_per_day"] else 0)
-)
-
-# Tone
-nudge_tone = c3.selectbox(
-    "Tone",
-    ["gentle", "coach", "strict"],
-    index=(["gentle", "coach", "strict"].index(pref_row.get("nudge_tone", "gentle"))
-           if pref_row.get("nudge_tone") in ["gentle", "coach", "strict"] else 0)
-)
-
-st.divider()
-
-# Timezone & Quiet hours
-st.subheader("Timing & Quiet Hours")
-tz_options = [
-    "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
-    "Europe/London", "Europe/Berlin", "Asia/Kolkata", "Asia/Singapore", "Australia/Sydney"
-]
-tz_val = pref_row.get("tz") or "America/New_York"
-tz = st.selectbox("Profile timezone", tz_options, index=tz_options.index(tz_val) if tz_val in tz_options else 0)
-
-qc1, qc2 = st.columns(2)
-quiet_start = _str_to_time(pref_row.get("quiet_start"), "22:00")
-quiet_end   = _str_to_time(pref_row.get("quiet_end"), "07:00")
-qs = qc1.time_input("Quiet hours start", value=quiet_start, step=300)
-qe = qc2.time_input("Quiet hours end",   value=quiet_end,   step=300)
-st.caption("During quiet hours, nudges are suppressed.")
-
-st.divider()
-
-# Goals
-st.subheader("Goals")
-gc1, gc2, gc3 = st.columns(3)
-
-steps_goal = gc1.number_input(
-    "Daily steps",
-    min_value=1000, max_value=30000, step=500,
-    value=int(pref_row.get("daily_step_goal") or (pref_row.get("goals", {}) or {}).get("steps") or 8000)
-)
-
-water_goal_l = gc2.number_input(
-    "Daily water (liters)",
-    min_value=0.5, max_value=6.0, step=0.25,
-    value=float((pref_row.get("daily_water_ml") or (pref_row.get("goals", {}) or {}).get("water_ml") or 2000)/1000.0)
-)
-
-sleep_goal_h = gc3.number_input(
-    "Sleep (hours)",
-    min_value=4.0, max_value=12.0, step=0.5,
-    value=float((pref_row.get("sleep_goal_min") or (pref_row.get("goals", {}) or {}).get("sleep_minutes") or 420)/60.0)
-)
-
-gc4, gc5, gc6 = st.columns(3)
-calorie_goal = gc4.number_input(
-    "Calories (kcal)",
-    min_value=1000, max_value=5000, step=50,
-    value=int(pref_row.get("daily_calorie_goal") or (pref_row.get("goals", {}) or {}).get("calories") or 2000)
-)
-
-protein_goal = gc5.number_input(
-    "Protein (g)",
-    min_value=20, max_value=300, step=5,
-    value=int(pref_row.get("protein_target_g") or (pref_row.get("goals", {}) or {}).get("protein") or 80)
-)
-
-sugar_limit = gc6.number_input(
-    "Added sugar (g) — soft target",
-    min_value=0, max_value=150, step=5,
-    value=int((pref_row.get("goals", {}) or {}).get("sugar") or 50)
-)
-
-st.divider()
-
-# Calendar suppression
-st.subheader("Calendar suppression")
-ics_url = st.text_input(
-    "Calendar ICS URL (optional)",
-    value=(pref_row or {}).get("calendar_ics_url") or "",  # <= coalesce None to ""
-    help="Paste a private ICS link from Google/Outlook/iCloud to silence nudges during events."
-)
-
-
-# Telegram (display only / optional override)
-st.subheader("Telegram")
-tg_display = (pref_row.get("telegram_chat_id") or "") or ""
-tg_col1, tg_col2 = st.columns([3,1])
-tg_col1.text_input("Linked Telegram chat id", value=str(tg_display), disabled=True)
-with tg_col2:
-    st.caption("Use /link in the bot to connect or re-link.")
-
-st.divider()
-
-# ================= Save =================
-save = st.button("Save preferences", type="primary")
-if save:
-    # convert liters/hours back to ml/min
-    water_ml = int(round(float(water_goal_l) * 1000))
-    sleep_min = int(round(float(sleep_goal_h) * 60))
-
-    # goals payload (kept for future expansion)
-    goals_payload = {
-        "steps": int(steps_goal),
-        "water_ml": water_ml,
-        "sleep_minutes": sleep_min,
-        "calories": int(calorie_goal),
-        "protein": int(protein_goal),
-        "sugar": int(sugar_limit),
+def load_prefs(uid_: str) -> dict:
+    r = exec_with_retry(sb.table("hw_preferences").select("*").eq("uid", uid_).maybe_single())
+    row = r.data or None
+    if row:
+        return row
+    # Defaults per schema
+    return {
+        "uid": uid_,
+        "nudge_channel": "telegram",
+        "quiet_start": "22:00:00",
+        "quiet_end": "07:00:00",
+        "nudge_cadence": "smart",
+        "nudge_tone": "gentle",
+        "goals": {},
+        "remind_hydration": True,
+        "remind_steps": True,
+        "remind_sleep": False,
+        "tz": "America/New_York",
+        "daily_calorie_goal": 2000,
+        "daily_step_goal": 8000,
+        "daily_water_ml": 2000,
+        "sleep_goal_min": 420,
+        "protein_target_g": 80,
+        "telegram_chat_id": None,
+        "calendar_ics_url": None,
+        "last_nudge_hash": None,
+        "telegram_chat_id_bigint": None,
     }
+
+def upsert_prefs(payload: dict):
+    exec_with_retry(sb.table("hw_preferences").upsert(payload, on_conflict="uid"))
+
+def idx_or_prepend(options: list[str], value: str, default_first: str | None = None) -> tuple[list[str], int]:
+    """
+    If value is in options -> return (options, index).
+    If not, prepend the value to options so selectbox can show it, return index 0.
+    If value is falsy -> use default_first if provided (and ensure it’s present).
+    """
+    if value and value in options:
+        return options, options.index(value)
+    if not value and default_first:
+        if default_first not in options:
+            options = [default_first] + options
+        return options, options.index(default_first)
+    # Prepend unknown legacy value (e.g., "coach")
+    if value:
+        options = [value] + [opt for opt in options if opt != value]
+        return options, 0
+    return options, 0
+
+def safe_time(val: str, fallback: str) -> dt.time:
+    try:
+        return dt.strptime(val or fallback, "%H:%M:%S").time()
+    except Exception:
+        return dt.strptime(fallback, "%H:%M:%S").time()
+
+# ---------------------------
+# UI
+# ---------------------------
+st.title("⚙️ Preferences")
+
+# Optional: quick whoami sanity check
+try:
+    who = exec_with_retry(sb.rpc("whoami"))
+    st.caption(f"whoami() reports: {who.data}")
+except Exception as e:
+    st.caption(f"whoami() failed: {e}")
+
+# Ensure FK target exists before touching prefs (matches FK in schema)
+ensure_hw_user(uid)
+
+current = load_prefs(uid)
+
+with st.form("prefs_form", clear_on_submit=False):
+    st.subheader("Notifications")
+
+    # Channels
+    channel_opts = ["telegram", "inapp", "email", "none"]
+    channel_val = current.get("nudge_channel", "telegram")
+    channel_opts, channel_idx = idx_or_prepend(channel_opts, channel_val, default_first="telegram")
+    nudge_channel = st.selectbox("Primary nudge channel", options=channel_opts, index=channel_idx)
+
+    # Cadence
+    cadence_opts = ["smart", "frequent", "sparse", "off"]
+    cadence_val = current.get("nudge_cadence", "smart")
+    cadence_opts, cadence_idx = idx_or_prepend(cadence_opts, cadence_val, default_first="smart")
+    nudge_cadence = st.selectbox("Nudge cadence", options=cadence_opts, index=cadence_idx)
+
+    # Tone — include legacy/custom values gracefully (e.g., "coach")
+    tone_opts = ["gentle", "direct", "cheerful", "clinical"]
+    tone_val = current.get("nudge_tone", "gentle")
+    tone_opts, tone_idx = idx_or_prepend(tone_opts, tone_val, default_first="gentle")
+    nudge_tone = st.selectbox("Tone", options=tone_opts, index=tone_idx)
+
+    st.divider()
+    st.subheader("Quiet Hours")
+    col_q1, col_q2 = st.columns(2)
+    with col_q1:
+        quiet_start = st.time_input("Quiet start", value=safe_time(current.get("quiet_start"), "22:00:00"))
+    with col_q2:
+        quiet_end = st.time_input("Quiet end", value=safe_time(current.get("quiet_end"), "07:00:00"))
+
+    st.divider()
+    st.subheader("Health Goals")
+    col1, col2 = st.columns(2)
+    with col1:
+        daily_step_goal = st.number_input("Daily step goal", min_value=0, step=500,
+                                          value=int(current.get("daily_step_goal", 8000) or 8000))
+        daily_water_ml = st.number_input("Daily water (ml)", min_value=0, step=100,
+                                         value=int(current.get("daily_water_ml", 2000) or 2000))
+        protein_target_g = st.number_input("Protein target (g)", min_value=0, step=5,
+                                           value=int(current.get("protein_target_g", 80) or 80))
+    with col2:
+        daily_calorie_goal = st.number_input("Daily calories (kcal)", min_value=0, step=50,
+                                             value=int(current.get("daily_calorie_goal", 2000) or 2000))
+        sleep_goal_min = st.number_input("Sleep goal (minutes)", min_value=0, step=15,
+                                         value=int(current.get("sleep_goal_min", 420) or 420))
+
+    st.divider()
+    st.subheader("Reminders")
+    col_r1, col_r2, col_r3 = st.columns(3)
+    with col_r1:
+        remind_hydration = st.toggle("Hydration", value=bool(current.get("remind_hydration", True)))
+    with col_r2:
+        remind_steps = st.toggle("Steps", value=bool(current.get("remind_steps", True)))
+    with col_r3:
+        remind_sleep = st.toggle("Sleep", value=bool(current.get("remind_sleep", False)))
+
+    st.divider()
+    st.subheader("Integrations")
+    tz = st.text_input("Time zone (IANA)", value=current.get("tz", "America/New_York") or "America/New_York")
+    telegram_chat_id = st.text_input("Telegram chat ID (text)", value=current.get("telegram_chat_id") or "")
+    calendar_ics_url = st.text_input("Calendar ICS URL", value=current.get("calendar_ics_url") or "")
+
+    submitted = st.form_submit_button("Save Preferences", use_container_width=True)
+
+if submitted:
     payload = {
         "uid": uid,
-        "tz": tz,
         "nudge_channel": nudge_channel,
+        "quiet_start": quiet_start.strftime("%H:%M:%S"),
+        "quiet_end": quiet_end.strftime("%H:%M:%S"),
         "nudge_cadence": nudge_cadence,
         "nudge_tone": nudge_tone,
-        "quiet_start": _time_to_str(qs),
-        "quiet_end": _time_to_str(qe),
-        "goals": goals_payload,
-        "daily_step_goal": goals_payload["steps"],
-        "daily_water_ml": goals_payload["water_ml"],
-        "sleep_goal_min": goals_payload["sleep_minutes"],
-        "daily_calorie_goal": goals_payload["calories"],
-        "protein_target_g": goals_payload["protein"],
-        "calendar_ics_url": (ics_url or "").strip() or None,
+        "goals": {
+            "daily_step_goal": int(daily_step_goal),
+            "daily_water_ml": int(daily_water_ml),
+            "daily_calorie_goal": int(daily_calorie_goal),
+            "sleep_goal_min": int(sleep_goal_min),
+            "protein_target_g": int(protein_target_g),
+        },
+        # denormalized columns for simple queries
+        "daily_step_goal": int(daily_step_goal),
+        "daily_water_ml": int(daily_water_ml),
+        "daily_calorie_goal": int(daily_calorie_goal),
+        "sleep_goal_min": int(sleep_goal_min),
+        "protein_target_g": int(protein_target_g),
+        "remind_hydration": bool(remind_hydration),
+        "remind_steps": bool(remind_steps),
+        "remind_sleep": bool(remind_sleep),
+        "tz": tz.strip() or "America/New_York",
+        "telegram_chat_id": telegram_chat_id.strip() or None,
+        "calendar_ics_url": calendar_ics_url.strip() or None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+
     try:
-        exec_with_retry(sb.table("hw_preferences").upsert(payload, on_conflict="uid"))
-        st.success("Preferences saved! Nudges will respect quiet hours and your calendar.")
+        ensure_hw_user(uid)
+        upsert_prefs(payload)
+        st.success("Preferences saved ✅")
+    except APIError as e:
+        if "PGRST303" in str(e) or "JWT expired" in str(e):
+            st.error("Your session expired. Please sign in again.")
+            on_sign_out()
+            st.switch_page("pages/02_Sign_In.py")
+            st.stop()
+        else:
+            st.error(f"Failed to save preferences: {e}")
     except Exception as e:
         st.error(f"Failed to save preferences: {e}")
 
-# ================= Info panel =================
-with st.expander("What do these settings do?", expanded=False):
-    st.markdown("""
-- **Channel**: where you receive nudges (Telegram or in-app).
-- **Cadence**: `smart` adapts to your day; `hourly` or `3_per_day` are fixed.
-- **Tone**: choose the coaching vibe of your nudges.
-- **Quiet hours**: nudges are muted (e.g., 22:00–07:00).
-- **Calendar ICS**: if set, nudges are suppressed during events.
-- **Goals**: drive streaks, badges, and pacing (steps/water/sleep/calories).
-    """)
+with st.expander("Debug (session)"):
+    ss = st.session_state.get("sb_session", {})
+    st.json({
+        "uid": uid,
+        "has_access_token": bool(ss.get("access_token")),
+        "has_refresh_token": bool(ss.get("refresh_token")),
+        "current_nudge_tone": current.get("nudge_tone"),
+        "current_nudge_channel": current.get("nudge_channel"),
+        "current_nudge_cadence": current.get("nudge_cadence"),
+    })
