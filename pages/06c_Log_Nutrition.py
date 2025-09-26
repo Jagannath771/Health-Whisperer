@@ -9,10 +9,11 @@ dotenv.load_dotenv()
 import streamlit as st
 from httpx import ReadError
 
-from nav import top_nav
 from services.nutrition_llm import estimate_meal, save_meal
 from supa import get_sb
+from nav import apply_global_ui, top_nav
 
+apply_global_ui()
 st.set_page_config(page_title="Log Nutrition - Health Whisperer",
                    layout="wide",
                    initial_sidebar_state="collapsed")

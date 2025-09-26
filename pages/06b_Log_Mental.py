@@ -2,15 +2,16 @@
 import time, json
 from datetime import datetime, timezone, date
 from zoneinfo import ZoneInfo
-
 import streamlit as st
 from httpx import ReadError
-from supabase import create_client
+from postgrest.exceptions import APIError
 
-from nav import top_nav
+
+from supa import get_sb
 from services.memory import embed_text
+from nav import apply_global_ui, top_nav
 
-# ---------- Page config ----------
+apply_global_ui()
 st.set_page_config(page_title="Log Mental - Health Whisperer",
                    layout="wide",
                    initial_sidebar_state="collapsed")
@@ -21,31 +22,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Retry helper ----------
-def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
-    for i in range(tries):
-        try:
-            return req.execute()
-        except Exception as e:
-            msg = str(e)
-            if "10035" in msg or isinstance(e, ReadError):
-                time.sleep(base_delay * (i + 1))
-                continue
-            raise
-    return req.execute()
-
-# ---------- Supabase client ----------
-@st.cache_resource
-def get_sb():
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["key"]
-    return create_client(url, key)
-sb = get_sb()
-
-# ---------- Navbar / Auth ----------
-def on_sign_out():
-    sb.auth.sign_out()
-    st.session_state.pop("sb_session", None)
+# ---- Auth / Nav ----
+def on_sign_out(sb=None):
+    try:
+        if sb: sb.auth.sign_out()
+    finally:
+        st.session_state.pop("sb_session", None)
 
 is_authed = "sb_session" in st.session_state
 top_nav(is_authed, on_sign_out, current="Log Mental")
@@ -55,8 +37,29 @@ if not is_authed:
     st.stop()
 
 uid = st.session_state["sb_session"]["user_id"]
+access_token = st.session_state["sb_session"]["access_token"]
+sb = get_sb(access_token)  # <-- authed client
 
-# ---------- Helpers ----------
+# ---- Retry helper ----
+def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
+    for i in range(tries):
+        try:
+            return req.execute()
+        except APIError as e:
+            if "PGRST303" in str(e) or "JWT expired" in str(e):
+                st.error("Your session expired. Please sign in again.")
+                on_sign_out(sb)
+                st.switch_page("pages/02_Sign_In.py")
+                st.stop()
+            raise
+        except Exception as e:
+            msg = str(e)
+            if "10035" in msg or isinstance(e, ReadError):
+                time.sleep(base_delay * (i + 1)); continue
+            raise
+    return req.execute()
+
+# ---- Helpers ----
 def _user_tz(uid: str) -> ZoneInfo:
     try:
         r = exec_with_retry(sb.table("hw_preferences").select("tz").eq("uid", uid).maybe_single())
@@ -99,7 +102,6 @@ with st.expander("Tips", expanded=False):
     st.write("• Use tags to cluster similar entries later (‘gratitude’, ‘work’, ‘sleep’).")
 
 if st.button("💾 Save Mental"):
-    # 1) Save into today’s manual metrics row
     payload = {
         "uid": uid,
         "source": "manual",
@@ -116,7 +118,6 @@ if st.button("💾 Save Mental"):
     except Exception:
         exec_with_retry(sb.table("hw_metrics").insert(payload))
 
-    # 2) Also append to a dedicated hw_journal table for RAG (NOW with embedding)
     try:
         emb = embed_text(journal) if (journal and journal.strip()) else None
         sb.table("hw_journal").insert({
@@ -127,7 +128,7 @@ if st.button("💾 Save Mental"):
             "embedding": emb
         }).execute()
     except Exception:
-        pass  # table might not exist yet; safe to ignore
+        pass
 
     st.success("Mental well-being saved for today.")
     today_row = _get_today_manual(uid)
