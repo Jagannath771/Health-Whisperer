@@ -218,30 +218,32 @@ def _bucket(val: int, size: int) -> int:
 
 def build_rule_nudges(uid: str) -> List[Dict]:
     """
-    Original rules-based nudges (unchanged logic), returned as a list.
+    Rules-based nudges (original logic kept) + NEW physical & mental signals.
     """
     pf = prefs(uid)
     tz = user_tz(uid)
     now_l = now_utc().astimezone(tz)
+
+    # keep using today's window, meals, latest metrics, 7-day anchors & RAG flags
     start_l, _ = today_bounds_local(uid)
-    meals = meals_between(uid, to_utc(start_l).isoformat(), to_utc(now_l).isoformat())
-    latest = latest_metrics_today(uid)
+    meals   = meals_between(uid, to_utc(start_l).isoformat(), to_utc(now_l).isoformat())
+    latest  = latest_metrics_today(uid)
     anchors = rolling_7d_profile(uid)
-    flags = _ctx_flags(uid)
+    flags   = _ctx_flags(uid)
 
     nudges: List[Dict] = []
 
-    # Goals defaults
+    # ---------- goals (unchanged defaults) ----------
     kcal_goal  = int(pf.get("daily_calorie_goal") or 2000)
     steps_goal = int(pf.get("daily_step_goal")   or 8000)
     water_goal = int(pf.get("daily_water_ml")    or 2000)
     sleep_goal = int(pf.get("sleep_goal_min")    or 420)
 
-    # Calories pacing
-    exp_frac = expected_fraction(now_l, anchors)
-    exp_kcal = int(kcal_goal * exp_frac)
+    # ---------- calories pacing (unchanged) ----------
+    exp_frac   = expected_fraction(now_l, anchors)
+    exp_kcal   = int(kcal_goal * exp_frac)
     actual_kcal = sum(int(m.get("calories") or 0) for m in meals)
-    kcal_def = max(0, exp_kcal - actual_kcal)
+    kcal_def   = max(0, exp_kcal - actual_kcal)
     if (kcal_def >= 150) and (not ate_recently(meals)) and now_l.hour >= 11 and not flags.get("fasting"):
         nudges.append({
             "type": "kcal_pace",
@@ -251,17 +253,17 @@ def build_rule_nudges(uid: str) -> List[Dict]:
             "hash_key": f"kcal_pace|{_bucket(kcal_def, KCAL_BUCKET)}"
         })
 
-    # Steps pacing
-    day_frac = (now_l.hour + now_l.minute/60.0)/24.0
-    exp_steps = int(steps_goal * max(0.0, min(1.0, day_frac*1.05)))
-    steps = int(latest.get("steps") or 0)
-    step_def = max(0, exp_steps - steps)
+    # ---------- steps pacing (unchanged + injury wording tweak) ----------
+    day_frac   = (now_l.hour + now_l.minute/60.0)/24.0
+    exp_steps  = int(steps_goal * max(0.0, min(1.0, day_frac*1.05)))
+    steps_now  = int(latest.get("steps") or 0)
+    step_def   = max(0, exp_steps - steps_now)
     if (step_def >= 500) and now_l.hour >= 10:
         title = "Move a little"
-        msg = f"{step_def} steps to stay on pace. 10–15 min brisk walk."
+        msg   = f"{step_def} steps to stay on pace. 10–15 min brisk walk."
         if flags.get("injury"):
             title = "Gentle movement"
-            msg = f"{step_def} step gap. Try a 10-min easy walk or light stretching today."
+            msg   = f"{step_def} step gap. Try a 10-min easy walk or light stretching."
         nudges.append({
             "type": "steps_pace",
             "icon": "🚶",
@@ -270,14 +272,14 @@ def build_rule_nudges(uid: str) -> List[Dict]:
             "hash_key": f"steps_pace|{_bucket(step_def, STEP_BUCKET)}"
         })
 
-    # Hydration blocks
+    # ---------- hydration blocks (unchanged) ----------
     if 9 <= now_l.hour <= 19:
         blocks = ((now_l.hour - 9)*60 + now_l.minute)//90
         exp_water = int(min(10, max(0, blocks)) * (water_goal/10))
     else:
         exp_water = 0
-    water = int(latest.get("water_ml") or 0)
-    water_def = max(0, exp_water - water)
+    water_now = int(latest.get("water_ml") or 0)
+    water_def = max(0, exp_water - water_now)
     if water_def >= 150:
         nudges.append({
             "type": "water_pace",
@@ -287,9 +289,9 @@ def build_rule_nudges(uid: str) -> List[Dict]:
             "hash_key": f"water_pace|{_bucket(water_def, WATER_BUCKET)}"
         })
 
-    # Recovery/safety
-    sleep = int(latest.get("sleep_minutes") or 0)
-    if sleep and sleep < sleep_goal:
+    # ---------- recovery/safety (unchanged) ----------
+    sleep_min = int(latest.get("sleep_minutes") or 0)
+    if sleep_min and sleep_min < sleep_goal:
         nudges.append({
             "type": "sleep_recovery",
             "icon": "😴",
@@ -307,14 +309,80 @@ def build_rule_nudges(uid: str) -> List[Dict]:
             "hash_key": "mood_reset|1"
         })
 
-    # RAG-priority tweaks
+    # =========================================================
+    # NEW: Physical health signals (energy, pain, heart rate)
+    # =========================================================
+    energy = int(latest.get("energy_level") or 0)
+    if energy and energy <= 2:
+        nudges.append({
+            "type": "low_energy",
+            "icon": "⚡",
+            "title": "Low energy",
+            "msg": "Energy is low — short walk, light stretch, or a glass of water can help.",
+            "hash_key": "low_energy|1"
+        })
+
+    pain = int(latest.get("pain_level") or 0)
+    if pain and pain >= 4:
+        nudges.append({
+            "type": "pain_recovery",
+            "icon": "🩹",
+            "title": "Take it easy",
+            "msg": "Pain seems high. Prioritize rest and gentle mobility; seek care if it persists.",
+            "hash_key": "pain_recovery|1"
+        })
+
+    hr = int(latest.get("heart_rate") or 0)
+    if hr and (hr > 110 or hr < 50):
+        nudges.append({
+            "type": "hr_check",
+            "icon": "❤️",
+            "title": "Heart rate check",
+            "msg": f"Logged HR is {hr} bpm. Ensure you’re calm & hydrated; consult a clinician if unusual.",
+            "hash_key": f"hr_check|{hr}"
+        })
+
+    # =========================================================
+    # NEW: Mental health signals (stress, anxiety, focus)
+    # =========================================================
+    stress = int(latest.get("stress_level") or 0)
+    if stress and stress >= 4 and 7 <= now_l.hour <= 22:
+        nudges.append({
+            "type": "stress_relief",
+            "icon": "🌿",
+            "title": "Stress check",
+            "msg": "Stress is high — try 2-min deep breathing or step away for a short break.",
+            "hash_key": "stress_relief|1"
+        })
+
+    anxiety = int(latest.get("anxiety_level") or 0)
+    if anxiety and anxiety >= 4 and 7 <= now_l.hour <= 22:
+        nudges.append({
+            "type": "anxiety_reset",
+            "icon": "🤝",
+            "title": "Anxiety support",
+            "msg": "Try grounding: 5 things you see, 4 touch, 3 hear, 2 smell, 1 taste.",
+            "hash_key": "anxiety_reset|1"
+        })
+
+    focus = int(latest.get("focus_level") or 0)
+    if focus and focus <= 2 and 8 <= now_l.hour <= 20:
+        nudges.append({
+            "type": "focus_boost",
+            "icon": "🎯",
+            "title": "Low focus",
+            "msg": "Focus dipping — take a 5-min break, stretch, or hydrate to reset.",
+            "hash_key": "focus_boost|1"
+        })
+
+    # ---------- RAG-priority tweaks (unchanged) ----------
     if flags.get("dehydrated"):
         for i, n in enumerate(nudges):
             if n.get("type") == "water_pace":
                 nudges.insert(0, nudges.pop(i))
                 break
     if flags.get("stress") and 8 <= now_l.hour <= 22:
-        if not any(n.get("type") == "breathing" for n in nudges):
+        if not any(n.get("type") in ("breathing","stress_relief") for n in nudges):
             nudges.insert(0, {
                 "type": "breathing",
                 "icon": "🌬️",
@@ -323,6 +391,7 @@ def build_rule_nudges(uid: str) -> List[Dict]:
                 "hash_key": "breathing|stress"
             })
 
+    # ---------- safety fallback (unchanged) ----------
     if not nudges and 10 <= now_l.hour <= 18:
         nudges.append({
             "type": "breathing",
@@ -333,6 +402,7 @@ def build_rule_nudges(uid: str) -> List[Dict]:
         })
 
     return nudges
+
 
 
 def nudges_hash(nudges: List[Dict]) -> str:

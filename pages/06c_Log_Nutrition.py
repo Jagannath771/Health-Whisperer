@@ -82,9 +82,22 @@ def _load_today_meals(uid_: str) -> list[dict]:
          .order("ts", desc=True).execute())
     return r.data or []
 
+def _load_today_water_events(uid_: str) -> list[dict]:
+    tz = _user_tz(uid_)
+    start_l = datetime.combine(_today(uid_), datetime.min.time(), tzinfo=tz)
+    end_l = start_l + timedelta(days=1)
+    r = (sb.table("hw_events").select("*")
+         .eq("uid", uid_)
+         .eq("kind", "water_logged")
+         .gte("ts", start_l.astimezone(timezone.utc).isoformat())
+         .lt("ts", end_l.astimezone(timezone.utc).isoformat())
+         .order("ts", desc=True).execute())
+    return r.data or []
+
 st.title("🍽️ Log Nutrition")
 st.caption("Free-text meals. Use “Parse with AI” to estimate macros, or save raw quickly (now vectorized for RAG).")
 
+# ---------------- Meals ----------------
 bc, lc = st.columns(2)
 with bc:
     b_txt = st.text_area("Breakfast", placeholder="e.g., 2 eggs, 2 toast with butter, coffee with milk")
@@ -107,15 +120,10 @@ save_raw = c1.button("💾 Save Raw (no AI)")
 parse_ai = c2.button("✨ Parse with AI (estimate & save)")
 
 def _save_raw_block(txt: str, when, meal_type: str):
-    """
-    IMPORTANT CHANGE:
-    Even for RAW saves we call `save_meal()` so rows include blurb + embedding,
-    making them retrievable by RAG immediately.
-    """
     if not txt:
         return
     when_u = _to_utc_from_local_time(when, uid) if when else datetime.now(timezone.utc)
-    parsed_min = {"items": [], "totals": {}}  # no macros, but build_blurb() will fall back to raw text
+    parsed_min = {"items": [], "totals": {}}
     save_meal(uid, raw_text=txt, parsed=parsed_min, when_utc=when_u, meal_type=meal_type, access_token=access_token)
 
 def _ai_block(txt: str, when, meal_type: str):
@@ -136,6 +144,55 @@ elif parse_ai:
         _ai_block(text, when, mt)
     st.success("Parsed & saved meals (vectorized).")
 
+# ---------------- Water ----------------
+st.divider()
+st.subheader("💧 Log Water Intake")
+with st.form("water_form"):
+    water_amt = st.number_input("Water (ml)", min_value=50, max_value=2000, step=50, value=250)
+    water_time = st.time_input("Time", value=None, step=300)
+    submitted_water = st.form_submit_button("Save Water Log")
+
+if submitted_water:
+    try:
+        when_u = _to_utc_from_local_time(water_time, uid) if water_time else datetime.now(timezone.utc)
+        now_iso = when_u.isoformat()
+        today_d = _today(uid).isoformat()
+
+        # 1) Read today's manual row
+        r = exec_with_retry(
+            sb.table("hw_metrics")
+              .select("id, water_ml")
+              .eq("uid", uid).eq("source","manual").eq("log_date", today_d)
+              .limit(1)
+        )
+        cur = (r.data[0] if r.data else None) or {}
+        new_total = int(cur.get("water_ml") or 0) + int(water_amt)
+
+        # 2) Upsert the daily manual row (single row per day by unique (uid,log_date,source))
+        payload = {
+            "uid": uid,
+            "source": "manual",
+            "log_date": today_d,
+            "ts": now_iso,              # keep the latest update time
+            "water_ml": new_total
+        }
+        exec_with_retry(sb.table("hw_metrics").upsert(payload, on_conflict="uid,log_date,source"))
+
+        # 3) Append a timestamped event so we can list exact times
+        exec_with_retry(sb.table("hw_events").insert({
+            "uid": uid,
+            "kind": "water_logged",
+            "ts": now_iso,
+            "processed": False,
+            "payload": {"water_ml": int(water_amt)}
+        }))
+
+        st.success(f"Added {int(water_amt)} ml (today total: {new_total} ml)")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Could not save water log: {e}")
+
+# ---------------- Meals list ----------------
 st.divider()
 st.subheader("Today’s meals")
 meals = _load_today_meals(uid)
@@ -149,3 +206,18 @@ else:
         st.markdown(f"**{m.get('meal_type','?').title()}** · {ts_local} — {f'{int(kcal)} kcal' if kcal is not None else 'kcal unknown'}")
         if m.get("items"): st.caption(str(m["items"]))
         if m.get("blurb"): st.caption(f"⃟ {m['blurb']}")
+
+# ---------------- Water list ----------------
+st.divider()
+st.subheader("Today’s water intake")
+events = _load_today_water_events(uid)
+if not events:
+    st.info("No water logs today yet.")
+else:
+    tz = _user_tz(uid)
+    total_ml = sum(int((e.get("payload") or {}).get("water_ml") or 0) for e in events)
+    st.metric("Total Water", f"{total_ml} ml")
+    for e in events:
+        ts_local = datetime.fromisoformat(e["ts"].replace("Z","+00:00")).astimezone(tz).strftime("%b %d, %Y • %I:%M %p")
+        amt = int((e.get("payload") or {}).get("water_ml") or 0)
+        st.markdown(f"- {amt} ml at {ts_local}")

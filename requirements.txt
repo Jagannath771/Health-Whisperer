@@ -12,3 +12,4 @@ icalendar
 python-dateutil==2.9.0.post0
 openai>=1.40.0
 dotenv
+plotly
