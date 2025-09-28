@@ -5,13 +5,15 @@ from datetime import datetime as dt
 import streamlit as st
 from postgrest.exceptions import APIError
 
-from nav import top_nav
+
 from supa import get_sb  # same helper used by Log Nutrition
 
 st.set_page_config(page_title="Preferences - Health Whisperer",
                    layout="centered",
                    initial_sidebar_state="collapsed")
+from nav import apply_global_ui, top_nav
 
+apply_global_ui()
 # ---------------------------
 # Small CSS (optional)
 # ---------------------------

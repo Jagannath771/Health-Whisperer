@@ -1,60 +1,62 @@
+# pages/04_Get_Started.py
 import streamlit as st
-from supabase import create_client
-import secrets
-import string
-from nav import top_nav
-st.set_page_config(page_title="Get Started - Health Whisperer",  layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
-<style>
-/* hide page links in sidebar */
-section[data-testid="stSidebarNav"] { display:none; }
-</style>
-""", unsafe_allow_html=True)
-# st.markdown("""
-# <style>
-# /* center the main block and widen to a nice max */
-# .block-container { max-width: 1100px; padding-top: 1rem; padding-bottom: 4rem; }
-# /* subtle section divider spacing */
-# hr { margin: 1.2rem 0; opacity: .25; }
-# </style>
-# """, unsafe_allow_html=True)
+import secrets, string
+from postgrest.exceptions import APIError
 
+from nav import apply_global_ui, top_nav
 
-@st.cache_resource
-def get_sb():
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["key"]
-    return create_client(url, key)
-sb = get_sb()
+apply_global_ui()
+from supa import get_sb
 
-def on_sign_out():
-    sb.auth.sign_out()
-    st.session_state.pop("sb_session", None)
+st.set_page_config(page_title="Get Started - Health Whisperer",
+                   layout="wide",
+                   initial_sidebar_state="collapsed")
+st.markdown("""<style>section[data-testid="stSidebarNav"]{display:none;}</style>""", unsafe_allow_html=True)
+
+def on_sign_out(sb=None):
+    try:
+        if sb: sb.auth.sign_out()
+    finally:
+        st.session_state.pop("sb_session", None)
 
 is_authed = "sb_session" in st.session_state
 top_nav(is_authed, on_sign_out, current="Get Started")
 
+if "sb_session" not in st.session_state:
+    st.warning("Please sign in first.")
+    st.switch_page("pages/02_Sign_In.py")
+    st.stop()
 
-def require_login():
-    if "sb_session" not in st.session_state:
-        st.warning("Please sign in first.")
-        st.switch_page("pages/02_Sign_In.py")
-
-require_login()
 user_id = st.session_state["sb_session"]["user_id"]
+access_token = st.session_state["sb_session"]["access_token"]
+sb = get_sb(access_token)  # <-- authed client
 bot_username = st.secrets["app"].get("bot_username", "HealthWhispererBot")
+
+# Retry helper
+def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
+    import time
+    for i in range(tries):
+        try:
+            return req.execute()
+        except APIError as e:
+            if "PGRST303" in str(e) or "JWT expired" in str(e):
+                st.error("Your session expired. Please sign in again.")
+                on_sign_out(sb); st.switch_page("pages/02_Sign_In.py"); st.stop()
+            raise
+        except Exception:
+            time.sleep(base_delay * (i + 1))
+    return req.execute()
 
 st.title("Connect to the Telegram Bot")
 st.write("Follow these steps to link your Telegram with your Health Whisperer profile.")
 
-# Ensure a link code exists for the user
 def get_or_create_link_code(user_id: str) -> str:
-    sel = sb.table("tg_links").select("link_code, telegram_id").eq("user_id", user_id).maybe_single().execute()
-    data = getattr(sel, "data", None)
+    sel = exec_with_retry(sb.table("tg_links").select("link_code, telegram_id").eq("user_id", user_id).maybe_single())
+    data = sel.data or None
     if data and data.get("link_code"):
         return data["link_code"]
     code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
-    sb.table("tg_links").upsert({"user_id": user_id, "link_code": code}).execute()
+    exec_with_retry(sb.table("tg_links").upsert({"user_id": user_id, "link_code": code}))
     return code
 
 code = get_or_create_link_code(user_id)

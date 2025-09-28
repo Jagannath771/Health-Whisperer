@@ -1,4 +1,5 @@
-import os, logging, json, datetime as dt
+# bot.py
+import os, logging, json, datetime as dt, re
 from typing import Optional, Tuple
 from dotenv import load_dotenv
 from supabase import create_client
@@ -11,12 +12,13 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-from services.llm_openai import chat_text
+from services.llm_openai import chat_text, embed_text
+from services.memory import retrieve_health_context  # RAG for chat
 
 # =================== Env & Clients ===================
 load_dotenv()
 SUPABASE_URL   = os.getenv("SUPABASE_URL")
-SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # MUST be service role
+SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # service role for bot/worker
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not all([SUPABASE_URL, SUPABASE_KEY, TELEGRAM_TOKEN]):
     raise RuntimeError("Missing .env values")
@@ -29,7 +31,6 @@ log = logging.getLogger("hw-bot")
 
 # =================== Helpers ===================
 def get_profile_for_telegram_id(tg_id: int):
-    # resolve via tg_links -> profiles
     link_res = sb.table("tg_links").select("user_id").eq("telegram_id", tg_id).maybe_single().execute()
     data = getattr(link_res, "data", None)
     if not data:
@@ -50,7 +51,6 @@ def user_timezone(uid: str) -> ZoneInfo:
         return ZoneInfo("America/New_York")
 
 def ensure_hw_user(uid: str, tg_id: Optional[int]):
-    """Make sure hw_users has a row for this uid (FK target for hw_metrics)."""
     try:
         sb.table("hw_users").upsert({
             "uid": uid,
@@ -59,8 +59,14 @@ def ensure_hw_user(uid: str, tg_id: Optional[int]):
     except Exception as e:
         log.info("ensure_hw_user skipped/failed: %s", e)
 
+def _make_meal_blurb(mtype: str, items: str | None, calories: int | None) -> str:
+    parts = []
+    if mtype: parts.append(mtype.capitalize())
+    if items: parts.append(items)
+    if calories is not None: parts.append(f"~{int(calories)} kcal")
+    return " • ".join(parts)
+
 def today_range_for_user(tz: ZoneInfo) -> Tuple[str, str]:
-    # local -> UTC ISO window
     now_l = dt.datetime.now(tz)
     start_l = now_l.replace(hour=0, minute=0, second=0, microsecond=0)
     end_l = start_l + dt.timedelta(days=1)
@@ -91,38 +97,47 @@ def _parse_items_kcal(text: str):
     return (items or None), cal
 
 def upsert_meals(uid: str, day_meals: dict) -> bool:
-    """
-    Store per-meal rows in hw_meals if table exists.
-    hw_meals schema: (id uuid default gen_random_uuid(), uid uuid, ts timestamptz default now(),
-                      meal_type text, items text, calories int)
-    """
+    """Insert hw_meals with blurb + embedding so RAG can retrieve."""
     try:
         rows = []
         now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+
         for mtype in ["breakfast","lunch","dinner","snacks"]:
             m = (day_meals.get(mtype) or {})
-            if m.get("items") or m.get("calories"):
+            items = m.get("items")
+            kcal  = int(m.get("calories") or 0) if m.get("calories") is not None else None
+            if items or (kcal is not None):
+                blurb = _make_meal_blurb(mtype, items, kcal)
+                emb = embed_text(blurb)
                 rows.append({
-                    "uid": uid, "ts": now_iso,
+                    "uid": uid,
+                    "ts": now_iso,
                     "meal_type": mtype,
-                    "items": m.get("items"),
-                    "calories": int(m.get("calories") or 0)
+                    "items": items,
+                    "calories": kcal,
+                    "blurb": blurb,
+                    "embedding": emb,
+                    "source": "bot"
                 })
+
         if rows:
             sb.table("hw_meals").insert(rows).execute()
         return True
     except Exception as e:
-        log.info("hw_meals insert failed or table missing; will embed meals JSON: %s", e)
+        log.info("hw_meals insert failed; falling back to meals_json. %s", e)
         return False
 
 def save_metrics(uid: str, answers: dict, tg_id_for_fix: Optional[int]):
+    """Persist a check-in. CRITICAL: include ts so 'today' filters work."""
     total_cal = sum(int((answers["meals"].get(k) or {}).get("calories") or 0)
                     for k in ["breakfast","lunch","dinner","snacks"])
     meals_ok = upsert_meals(uid, answers["meals"])
 
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()  # <-- add ts
     payload = {
         "uid": uid,
         "source": "bot",
+        "ts": now_iso,                    # <--- key fix
         "heart_rate": answers.get("heart_rate"),
         "steps": answers.get("steps"),
         "sleep_minutes": answers.get("sleep_minutes"),
@@ -138,7 +153,6 @@ def save_metrics(uid: str, answers: dict, tg_id_for_fix: Optional[int]):
         sb.table("hw_metrics").insert(payload).execute()
         log.info("Saved metrics for uid=%s (kcal=%s steps=%s sleep=%s)", uid, total_cal, answers.get("steps"), answers.get("sleep_minutes"))
     except APIError as e:
-        # If missing FK to hw_users (first-time users), create and retry
         if getattr(e, "code", "") == "23503" or "not present in table \"hw_users\"" in str(e):
             ensure_hw_user(uid, tg_id_for_fix)
             sb.table("hw_metrics").insert(payload).execute()
@@ -146,7 +160,60 @@ def save_metrics(uid: str, answers: dict, tg_id_for_fix: Optional[int]):
         else:
             raise
 
-def build_prompt(profile: dict, user_text: str) -> str:
+def _recent_context_snippets(uid: str, k: int = 8) -> str:
+    """Short snippets from unified history (journal, meals blurbs, chat)."""
+    try:
+        ctx = retrieve_health_context(uid, "chat", k=k) or []
+        snips = []
+        for r in ctx:
+            if isinstance(r, dict):
+                for key in ("text", "items", "blurb"):
+                    v = r.get(key)
+                    if isinstance(v, str) and v.strip():
+                        snips.append(v.strip())
+        joined = " ".join(snips)
+        return joined[:2000]
+    except Exception:
+        return ""
+
+def _fmt(val, unit=""):
+    if val is None: return "—"
+    try:
+        if unit:
+            return f"{int(val)}{unit}"
+        return f"{int(val)}"
+    except Exception:
+        return str(val)
+
+def summarize_physical(today: dict) -> str:
+    steps = today.get("steps")
+    sleep = today.get("sleep_minutes")
+    hr    = today.get("heart_rate")
+    pain  = today.get("pain_level")
+    energy= today.get("energy_level")
+    parts = []
+    parts.append(f"Steps: {_fmt(steps)}")
+    parts.append(f"Sleep: {_fmt(sleep,' min')}")
+    if hr is not None: parts.append(f"HR: {_fmt(hr,' bpm')}")
+    if pain is not None: parts.append(f"Pain: {_fmt(pain)} /5")
+    if energy is not None: parts.append(f"Energy: {_fmt(energy)} /5")
+    return " | ".join(parts)
+
+def summarize_mental(today: dict) -> str:
+    mood   = today.get("mood")
+    stress = today.get("stress_level")
+    anx    = today.get("anxiety_level")
+    focus  = today.get("focus_level")
+    parts = []
+    if mood is not None:   parts.append(f"Mood: {_fmt(mood)} /5")
+    if stress is not None: parts.append(f"Stress: {_fmt(stress)} /5")
+    if anx is not None:    parts.append(f"Anxiety: {_fmt(anx)} /5")
+    if focus is not None:  parts.append(f"Focus: {_fmt(focus)} /5")
+    return " | ".join(parts) if parts else "No mental metrics logged today."
+
+def build_prompt(profile: dict, user_text: str, today: dict) -> str:
+    # Enrich with recent context + latest metrics
+    ctx_snips = _recent_context_snippets(profile["id"], k=8)
     return f"""
 You are Health Whisperer, a supportive wellness coach. Give brief, actionable, safe suggestions.
 Never give medical diagnoses. If symptoms are serious, advise seeing a clinician.
@@ -162,6 +229,12 @@ User profile:
 - Conditions: {profile.get('conditions')}
 - Medications: {profile.get('medications')}
 - Timezone: {profile.get('timezone')}
+
+Latest metrics today:
+{today}
+
+Recent context (journal/meals/chat blurbs, last few days):
+{ctx_snips}
 
 User message: {user_text}
 
@@ -191,7 +264,6 @@ async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def unlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     try:
-        # Clear preferences + tg_links for this telegram_id
         row = sb.table("tg_links").select("user_id").eq("telegram_id", tg_id).maybe_single().execute().data or {}
         uid = row.get("user_id")
         if uid:
@@ -210,24 +282,18 @@ async def link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
 
     try:
-        # 1) Find the row by link_code
         res = sb.table("tg_links").select("user_id, link_code, telegram_id").eq("link_code", code).maybe_single().execute()
         row = getattr(res, "data", None)
         if not row:
             return await update.message.reply_text("Invalid or expired code. Generate a fresh one in the website.")
 
         user_id_for_code = row["user_id"]
-
-        # 2) Attach THIS Telegram account to THAT code row (no upsert to avoid unique collisions)
         sb.table("tg_links").update({"telegram_id": tg_id}).eq("link_code", code).execute()
-
-        # 3) Remove any other rows that still point to this telegram_id (stale links)
         try:
             sb.table("tg_links").delete().neq("link_code", code).eq("telegram_id", tg_id).execute()
         except Exception:
             pass
 
-        # 4) Ensure hw_users + mirror into hw_preferences.telegram_chat_id (delivery path used by worker)
         ensure_hw_user(user_id_for_code, tg_id)
         try:
             sb.table("hw_preferences").upsert({"uid": user_id_for_code, "telegram_chat_id": tg_id}).execute()
@@ -335,7 +401,13 @@ async def finish_checkin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# =================== Free-text nudges ===================
+# =================== Free-text: smart Q&A first; LLM second ===================
+STEP_PAT = re.compile(r"\b(steps?|step\s*count)\b", re.I)
+SLEEP_PAT = re.compile(r"\b(sleep|minutes\s*of\s*sleep)\b", re.I)
+HR_PAT = re.compile(r"\b(heart\s*rate|hr)\b", re.I)
+PHYS_PAT = re.compile(r"\b(physical\s*health|fitness|how\s*am\s*i\s*physically)\b", re.I)
+MENT_PAT = re.compile(r"\b(mental\s*health|mood|stress|anxiety|focus|how\s*am\s*i\s*mentally)\b", re.I)
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     try:
@@ -347,13 +419,28 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not profile:
         return await update.message.reply_text("Please link your account first: /link <CODE> (from the website).")
 
-    # If no metrics today (by user's timezone), offer a quick check-in
     tz = user_timezone(profile["id"])
-    today = get_today_metrics(profile["id"], tz)
-    if not today:
-        await update.message.reply_text("I don’t see today’s log. Want to do a quick /checkin ?")
+    today = get_today_metrics(profile["id"], tz) or {}
 
-    prompt = build_prompt(profile, update.message.text)
+    text = update.message.text or ""
+    # 1) Quick answers from today's metrics
+    if today:
+        if STEP_PAT.search(text):
+            val = today.get("steps")
+            return await update.message.reply_text(f"Steps today: {_fmt(val)}.")
+        if SLEEP_PAT.search(text):
+            val = today.get("sleep_minutes")
+            return await update.message.reply_text(f"Sleep last night: {_fmt(val,' min')}.")
+        if HR_PAT.search(text):
+            val = today.get("heart_rate")
+            return await update.message.reply_text(f"Current HR (last log): {_fmt(val,' bpm')}.")
+        if PHYS_PAT.search(text):
+            return await update.message.reply_text(f"Physical snapshot — {summarize_physical(today)}")
+        if MENT_PAT.search(text):
+            return await update.message.reply_text(f"Mental snapshot — {summarize_mental(today)}")
+
+    # 2) If no direct metric intent, generate a brief contextual tip
+    prompt = build_prompt(profile, text, today)
     try:
         reply = chat_text(
             "You are Personalized Health Whisperer. Keep replies under 80 words; no medical diagnosis.",
@@ -366,7 +453,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("LLM generation failed: %s", e)
         await update.message.reply_text("I couldn't generate a tip right now. Please try again later.")
 
-# =================== Error handler ===================
+# =================== Error handler & app wiring ===================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Bot error", exc_info=context.error)
     try:
@@ -375,7 +462,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         pass
 
-# =================== App wiring ===================
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_error_handler(on_error)

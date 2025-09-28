@@ -1,6 +1,8 @@
 import streamlit as st
 from supabase import create_client
-from nav import top_nav
+from nav import apply_global_ui, top_nav
+
+apply_global_ui()
 st.set_page_config(page_title="Sign In - Health Whisperer",  layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
 <style>

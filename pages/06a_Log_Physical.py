@@ -1,45 +1,26 @@
 # pages/06a_Log_Physical.py
 import time
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, date
 from zoneinfo import ZoneInfo
-
 import streamlit as st
 from httpx import ReadError
-from supabase import create_client
+from postgrest.exceptions import APIError
 
-from nav import top_nav
+from supa import get_sb
+from nav import apply_global_ui, top_nav
 
-# ---------- Page config ----------
+apply_global_ui()
 st.set_page_config(page_title="Log Physical - Health Whisperer",
                    layout="wide",
                    initial_sidebar_state="collapsed")
 st.markdown("<style>section[data-testid='stSidebarNav']{display:none;}</style>", unsafe_allow_html=True)
 
-# ---------- Retry helper ----------
-def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
-    for i in range(tries):
-        try:
-            return req.execute()
-        except Exception as e:
-            msg = str(e)
-            if "10035" in msg or isinstance(e, ReadError):
-                time.sleep(base_delay * (i + 1))
-                continue
-            raise
-    return req.execute()
-
-# ---------- Supabase client ----------
-@st.cache_resource
-def get_sb():
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["key"]
-    return create_client(url, key)
-sb = get_sb()
-
-# ---------- Navbar / Auth ----------
-def on_sign_out():
-    sb.auth.sign_out()
-    st.session_state.pop("sb_session", None)
+# ---- Auth / Nav ----
+def on_sign_out(sb=None):
+    try:
+        if sb: sb.auth.sign_out()
+    finally:
+        st.session_state.pop("sb_session", None)
 
 is_authed = "sb_session" in st.session_state
 top_nav(is_authed, on_sign_out, current="Log Physical")
@@ -49,8 +30,29 @@ if not is_authed:
     st.stop()
 
 uid = st.session_state["sb_session"]["user_id"]
+access_token = st.session_state["sb_session"]["access_token"]
+sb = get_sb(access_token)  # authed client (RLS)
 
-# ---------- Helpers ----------
+# ---- Retry helper ----
+def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
+    for i in range(tries):
+        try:
+            return req.execute()
+        except APIError as e:
+            if "PGRST303" in str(e) or "JWT expired" in str(e):
+                st.error("Your session expired. Please sign in again.")
+                on_sign_out(sb)
+                st.switch_page("pages/02_Sign_In.py")
+                st.stop()
+            raise
+        except Exception as e:
+            msg = str(e)
+            if "10035" in msg or isinstance(e, ReadError):
+                time.sleep(base_delay * (i + 1)); continue
+            raise
+    return req.execute()
+
+# ---- Helpers ----
 def _user_tz(uid: str) -> ZoneInfo:
     try:
         r = exec_with_retry(sb.table("hw_preferences").select("tz").eq("uid", uid).maybe_single())
@@ -73,7 +75,7 @@ def _get_today_manual(uid: str) -> dict:
     r = exec_with_retry(req)
     return (r.data[0] if r.data else {}) or {}
 
-# ---------- Load existing row (if any) ----------
+# ---- UI ----
 today_row = _get_today_manual(uid)
 
 st.title("🏃 Log Physical Health")
@@ -94,10 +96,12 @@ note = st.text_area("Short note (optional)", value=today_row.get("notes") or "",
                     placeholder="e.g., Morning run; sore calves; long sit today")
 
 if st.button("💾 Save Physical"):
+    now_u = datetime.now(timezone.utc)
     payload = {
         "uid": uid,
         "source": "manual",
         "log_date": _today(uid).isoformat(),
+        "ts": now_u.isoformat(),                 # <-- CRITICAL for worker/ bot visibility
         "steps": int(steps or 0),
         "sleep_minutes": int(sleep_min or 0),
         "heart_rate": int(heart_rate or 0),
@@ -106,12 +110,21 @@ if st.button("💾 Save Physical"):
         "notes": note or None,
     }
     try:
-        # Prefer upsert on (uid, source, log_date) if a constraint exists
-        sb.table("hw_metrics").upsert(payload, on_conflict="uid,source,log_date").execute()
+        # upsert keeps one row per (uid, source, log_date) but refreshes ts and values
+        exec_with_retry(sb.table("hw_metrics").upsert(payload, on_conflict="uid,source,log_date"))
         st.success("Saved to today’s manual metrics.")
     except Exception:
-        # Fallback: insert a new row (latest wins in your queries)
         exec_with_retry(sb.table("hw_metrics").insert(payload))
         st.info("Saved as a new manual metrics row for today.")
+
+    # Fire a lightweight event so the nudge worker can react immediately
+    try:
+        exec_with_retry(sb.table("hw_events").insert({
+            "uid": uid,
+            "kind": "metrics_saved",
+            "payload": {"source": "manual", "steps": int(steps or 0)}
+        }))
+    except Exception:
+        pass
 
     today_row = _get_today_manual(uid)

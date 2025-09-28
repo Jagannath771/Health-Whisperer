@@ -1,0 +1,120 @@
+/* -------- Health Whisperer Global Theme -------- */
+:root{
+  --bg: #0f121a;
+  --surface: rgba(255,255,255,0.06);
+  --surface-2: rgba(255,255,255,0.08);
+  --border: rgba(255,255,255,0.10);
+  --text: #e6e9ef;
+  --text-dim: #b8c0cc;
+  --brand: #10b981;     /* teal/green */
+  --brand-2: #60a5fa;   /* blue accent */
+  --shadow: 0 6px 30px rgba(0,0,0,.35);
+}
+
+/* App background (use gradient + optional image) */
+html, body, [data-testid="stAppViewContainer"] {
+  background:
+    radial-gradient(1200px 700px at 5% 0%, rgba(16,185,129,0.10), transparent 60%),
+    radial-gradient(900px 600px at 95% 15%, rgba(96,165,250,0.10), transparent 60%),
+    var(--bg);
+  color: var(--text);
+}
+
+/* Optional: add your image (place at ./assets/bg.png) */
+body.hw-bg-image {
+  background-image: url("assets/bg.png");
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  background-size: cover;
+  background-position: top right;
+}
+
+/* Tighter container for modern look */
+.block-container { max-width: 1120px; padding-top: .6rem; padding-bottom: 3rem; }
+
+/* Hide default sidebar & gutter (safety net; we also do it in Python) */
+[data-testid="stSidebar"], [data-testid="stSidebarNav"],
+section[data-testid="stSidebar"], section[data-testid="stSidebarNav"],
+div[data-testid="stSidebar"], div[data-testid="stSidebarNav"] { display: none !important; }
+[data-testid="stAppViewContainer"] > .main { margin-left: 0 !important; }
+
+/* Typography */
+h1, h2, h3 { color: var(--text); }
+p, li, span, a { color: var(--text); }
+small, .caption, .st-emotion-cache-gi0tri { color: var(--text-dim) !important; }
+
+/* Cards / hero */
+.hw-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 24px;
+  box-shadow: var(--shadow);
+}
+.hw-hero {
+  background:
+    radial-gradient(900px 600px at 5% 0%, rgba(16,185,129,0.16), transparent 60%),
+    radial-gradient(800px 520px at 95% 18%, rgba(96,165,250,0.14), transparent 60%),
+    var(--surface-2);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 24px;
+  padding: 40px;
+  margin-top: 8px;
+}
+.hw-hero h1 { margin: 0 0 8px 0; font-size: 42px; }
+.hw-hero h3 { margin: 0 0 10px 0; font-weight: 500; color: var(--text); }
+.hw-hero p  { margin: 0; font-size: 18px; color: var(--text-dim); }
+
+/* Dividers */
+hr, .stDivider { opacity: .25; }
+
+/* --- Top nav pills --- */
+.hw-bar-wrap { position: sticky; top: 0; z-index: 999;
+  background: rgba(16,18,27,0.65);
+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.hw-bar { display:flex; align-items:center; gap:14px; padding: 10px 8px; }
+
+/* Two groups that flow horizontally */
+.hw-group {
+  display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+}
+
+/* Each pill wraps a Streamlit page_link (which renders an <a>) */
+.hw-pill {
+  display:inline-flex; align-items:center;
+  padding:6px 12px;
+  border:1px solid rgba(255,255,255,.12);
+  border-radius:999px; white-space:nowrap;
+  transition: all .2s ease;
+  background: rgba(255,255,255,0.03);
+}
+.hw-pill a { text-decoration:none !important; color: var(--text) !important; }
+
+/* Hover + active */
+.hw-pill:hover {
+  transform: translateY(-1px);
+  border-color: rgba(96,165,250,.55);
+  box-shadow: 0 10px 24px rgba(96,165,250,.14);
+}
+.hw-active {
+  border-color: rgba(16,185,129,.65) !important;
+  background: rgba(16,185,129,.15) !important;
+  box-shadow: 0 10px 24px rgba(16,185,129,.18);
+}
+
+/* Buttons (incl. Sign out) */
+.stButton>button {
+  background: rgba(255,255,255,0.06);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.stButton>button:hover {
+  filter: brightness(1.08);
+  border-color: rgba(96,165,250,.5);
+}
+
+/* Streamlit info/warn boxes on dark bg */
+.stAlert { border-radius: 14px; border: 1px solid rgba(255,255,255,.12); }

@@ -1,70 +1,82 @@
 # nav.py
 import streamlit as st
+from pathlib import Path
 
-# Key, path, label
-LINKS = [
-    ("Home",          "app.py",                  "🏠 Home"),
-    ("Sign Up",       "pages/01_Sign_Up.py",     "📝 Sign Up"),
-    ("Sign In",       "pages/02_Sign_In.py",     "🔐 Sign In"),
-    ("My Profile",    "pages/03_My_Profile.py",  "🧩 My Profile"),
-    ("Dashboard",     "pages/05_Dashboard.py",   "📊 Dashboard"),
-    ("Get Started",   "pages/04_Get_Started.py", "🚀 Get Started"),
-    ("Log Physical",  "pages/06a_Log_Physical.py","🏃 Log Physical"),
-    ("Log Mental",    "pages/06b_Log_Mental.py", "🧠 Log Mental"),
-    ("Log Nutrition", "pages/06c_Log_Nutrition.py","🍽️ Log Nutrition"),
-    ("Preferences",   "pages/07_Preferences.py", "⚙️ Preferences"),
-    ("Notifications", "pages/08_Notifications.py","🔔 Notifications"),
-]
+THEME_PATH = Path(__file__).parent / "theme.css"
 
-def _render_links(current_key: str):
-    """Render links and put a subtle marker on the active one."""
-    # left/mid/right columns like your original layout
-    left, right = st.columns([9, 1])
-    with left:
-        # group roughly like before
-        for key, path, label in LINKS:
-            # add a small dot to the active page
-            lbl = f"{label} •" if key == current_key else label
-            st.page_link(path, label=lbl)
-    with right:
-        st.markdown('<div class="hw-right"></div>', unsafe_allow_html=True)
+def _inject_theme():
+    css = ""
+    try:
+        css = THEME_PATH.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    if css:
+        st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+        # Optional: enable image background if you created ./assets/bg.png
+        st.markdown("<script>document.body.classList.add('hw-bg-image');</script>", unsafe_allow_html=True)
 
-def top_nav(is_authed: bool = False, on_sign_out=None, current: str = ""):
+def apply_global_ui():
     """
-    Minimal, sticky nav bar with page links and an optional Sign out.
-    Call like: top_nav(is_authed, on_sign_out, current="Home")
+    Call at the top of EVERY page before drawing content.
+    Hides Streamlit's sidebar + collapse button, sets layout wide, injects theme.css.
     """
-    on_sign_out = on_sign_out or (lambda: None)
-
-    # Styles (unchanged)
+    st.set_page_config(layout="wide", initial_sidebar_state="collapsed")
+    # Safety net hide (in case CSS fails for a sec)
     st.markdown("""
     <style>
-      section[data-testid="stSidebarNav"] { display:none; }
-      .hw-bar-wrap { position: sticky; top: 0; z-index: 999;
-                     background: rgba(255,255,255,0.78);
-                     -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
-                     border-bottom: 1px solid rgba(0,0,0,0.06); }
-      .hw-bar { display:flex; gap:12px; align-items:center; padding: 10px 4px; overflow-x:auto; }
-      .block-container { padding-top: 8px; }
-      .hw-right { display:flex; justify-content:flex-end; }
+      [data-testid="stSidebar"], [data-testid="stSidebarNav"],
+      section[data-testid="stSidebar"], section[data-testid="stSidebarNav"],
+      div[data-testid="stSidebar"], div[data-testid="stSidebarNav"] { display: none !important; }
+      [data-testid="stAppViewContainer"] > .main { margin-left: 0 !important; }
     </style>
     """, unsafe_allow_html=True)
+    _inject_theme()
 
-    st.markdown('<div class="hw-bar-wrap">', unsafe_allow_html=True)
+def top_nav(is_authed: bool = False, on_sign_out=None, current: str = ""):
+    on_sign_out = on_sign_out or (lambda: None)
 
-    # ✅ FIX: pass the current page key into _render_links
-    _render_links(current)
+    # wrapper + minimal structure (styling is from theme.css)
+    st.markdown('<div class="hw-bar-wrap"><div class="hw-bar">', unsafe_allow_html=True)
 
-    # Right-side auth button area (kept as in your file)
-    right = st.columns([1])[0]
-    with right:
-        st.markdown('<div class="hw-right">', unsafe_allow_html=True)
-        if is_authed:
-            if st.button("Sign out", use_container_width=True):
-                on_sign_out()
-                st.switch_page("app.py")
-        else:
-            st.page_link("pages/02_Sign_In.py", label="Sign in", use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+    main_links = [
+        ("Home",        "app.py",                   "🏠 Home"),
+        ("Get Started", "pages/04_Get_Started.py",  "🚀 Get Started"),
+        ("Dashboard",   "pages/05_Dashboard.py",    "📊 Dashboard"),
+        ("Notify",      "pages/08_Notifications.py","🔔 Notifications"),
+    ]
+    log_links = [
+        ("LogPhysical",  "pages/06a_Log_Physical.py",  "🏃 Log Physical"),
+        ("LogMental",    "pages/06b_Log_Mental.py",    "🧠 Log Mental"),
+        ("LogNutrition", "pages/06c_Log_Nutrition.py", "🍽️ Log Nutrition"),
+    ]
 
+    # main group
+    st.markdown('<div class="hw-group">', unsafe_allow_html=True)
+    for key, path, label in main_links:
+        cls = "hw-pill hw-active" if key == current else "hw-pill"
+        st.markdown(f'<span class="{cls}">', unsafe_allow_html=True)
+        st.page_link(path, label=label)
+        st.markdown('</span>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # logs group
+    st.markdown('<div class="hw-group">', unsafe_allow_html=True)
+    for key, path, label in log_links:
+        cls = "hw-pill hw-active" if key == current else "hw-pill"
+        st.markdown(f'<span class="{cls}">', unsafe_allow_html=True)
+        st.page_link(path, label=label)
+        st.markdown('</span>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # spacer
+    st.markdown('<div style="flex:1"></div>', unsafe_allow_html=True)
+
+    # auth
+    if is_authed:
+        if st.button("Sign out"):
+            on_sign_out()
+            st.switch_page("app.py")
+    else:
+        st.page_link("pages/02_Sign_In.py", label="Sign in")
+
+    st.markdown('</div></div>', unsafe_allow_html=True)

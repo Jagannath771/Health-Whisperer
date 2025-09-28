@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 import streamlit as st
 from supabase import create_client
 from httpx import ReadError
-from nav import top_nav
+from nav import apply_global_ui, top_nav
+
+apply_global_ui()
 
 # ---------- Page config ----------
 st.set_page_config(page_title="Notifications - Health Whisperer",
