@@ -6,9 +6,8 @@ import streamlit as st
 from httpx import ReadError
 from postgrest.exceptions import APIError
 
-
 from supa import get_sb
-from services.memory import embed_text
+from services.llm_openai import embed_text
 from nav import apply_global_ui, top_nav
 
 apply_global_ui()
@@ -22,7 +21,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---- Auth / Nav ----
 def on_sign_out(sb=None):
     try:
         if sb: sb.auth.sign_out()
@@ -38,9 +36,8 @@ if not is_authed:
 
 uid = st.session_state["sb_session"]["user_id"]
 access_token = st.session_state["sb_session"]["access_token"]
-sb = get_sb(access_token)  # <-- authed client
+sb = get_sb(access_token)
 
-# ---- Retry helper ----
 def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
     for i in range(tries):
         try:
@@ -49,17 +46,14 @@ def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
             if "PGRST303" in str(e) or "JWT expired" in str(e):
                 st.error("Your session expired. Please sign in again.")
                 on_sign_out(sb)
-                st.switch_page("pages/02_Sign_In.py")
-                st.stop()
+                st.switch_page("pages/02_Sign_In.py"); st.stop()
             raise
         except Exception as e:
-            msg = str(e)
-            if "10035" in msg or isinstance(e, ReadError):
+            if "10035" in str(e) or isinstance(e, ReadError):
                 time.sleep(base_delay * (i + 1)); continue
             raise
     return req.execute()
 
-# ---- Helpers ----
 def _user_tz(uid: str) -> ZoneInfo:
     try:
         r = exec_with_retry(sb.table("hw_preferences").select("tz").eq("uid", uid).maybe_single())
@@ -77,8 +71,7 @@ def _today(uid: str) -> date:
 def _get_today_manual(uid: str) -> dict:
     t = _today(uid).isoformat()
     req = (sb.table("hw_metrics").select("*")
-           .eq("uid", uid).eq("source", "manual").eq("log_date", t)
-           .limit(1))
+           .eq("uid", uid).eq("source", "manual").eq("log_date", t).limit(1))
     r = exec_with_retry(req)
     return (r.data[0] if r.data else {}) or {}
 
@@ -97,15 +90,13 @@ cbt_tag = st.selectbox("Quick CBT tag (optional)", ["", "reframe", "gratitude", 
 journal = st.text_area("Journal", value=today_row.get("journal") or "", height=180,
                        placeholder="Free-write—what’s on your mind?")
 
-with st.expander("Tips", expanded=False):
-    st.write("• Keep entries short but concrete (what happened, feelings, what you did).")
-    st.write("• Use tags to cluster similar entries later (‘gratitude’, ‘work’, ‘sleep’).")
-
 if st.button("💾 Save Mental"):
+    now_u = datetime.now(timezone.utc)
     payload = {
         "uid": uid,
         "source": "manual",
         "log_date": _today(uid).isoformat(),
+        "ts": now_u.isoformat(),              # <-- CRITICAL for worker/bot visibility
         "mood": int(mood),
         "stress_level": int(stress),
         "anxiety_level": int(anx),
@@ -114,19 +105,30 @@ if st.button("💾 Save Mental"):
         "journal_tag": (cbt_tag or None),
     }
     try:
-        sb.table("hw_metrics").upsert(payload, on_conflict="uid,source,log_date").execute()
+        exec_with_retry(sb.table("hw_metrics").upsert(payload, on_conflict="uid,source,log_date"))
     except Exception:
         exec_with_retry(sb.table("hw_metrics").insert(payload))
 
+    # Also log optional journal to vector table for RAG
     try:
         emb = embed_text(journal) if (journal and journal.strip()) else None
-        sb.table("hw_journal").insert({
+        exec_with_retry(sb.table("hw_journal").insert({
             "uid": uid,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": now_u.isoformat(),
             "text": journal or "",
             "tags": [cbt_tag] if cbt_tag else [],
             "embedding": emb
-        }).execute()
+        }))
+    except Exception:
+        pass
+
+    # Fire a lightweight event so the nudge worker can react immediately
+    try:
+        exec_with_retry(sb.table("hw_events").insert({
+            "uid": uid,
+            "kind": "metrics_saved",
+            "payload": {"source": "manual", "mood": int(mood)}
+        }))
     except Exception:
         pass
 

@@ -12,6 +12,7 @@ from telegram.constants import ParseMode
 from icalendar import Calendar
 import httpx
 from services.memory import retrieve_health_context
+from services.llm_openai import chat_nudge  # <-- LLM nudge (Step 2/3/5)
 
 # =================== Env & clients ===================
 load_dotenv()
@@ -27,12 +28,12 @@ bot = Bot(token=TELEGRAM_TOKEN)
 log = logging.getLogger("nudge_worker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-# ------------------ Tunables (feel free to tweak) ------------------
-STEP_BUCKET = 500            # de-dup bucket size for steps deficit
-KCAL_BUCKET = 100            # de-dup bucket size for kcal deficit
-WATER_BUCKET = 100           # de-dup bucket size for water ml deficit
-COOLDOWN_MIN_PER_TYPE = 5    # minimum minutes between SAME TYPE nudges
-RUN_EVERY_SECONDS = 60       # main loop frequency
+# ------------------ Tunables ------------------
+STEP_BUCKET = 500
+KCAL_BUCKET = 100
+WATER_BUCKET = 100
+COOLDOWN_MIN_PER_TYPE = 5
+RUN_EVERY_SECONDS = 60
 
 # =================== Time helpers ===================
 def now_utc() -> datetime:
@@ -66,6 +67,13 @@ def prefs(uid: str) -> dict:
     except Exception:
         return {}
 
+def profile(uid: str) -> dict:
+    try:
+        r = sb.table("profiles").select("*").eq("id", uid).maybe_single().execute()
+        return r.data or {}
+    except Exception:
+        return {}
+
 def latest_metrics_today(uid: str) -> dict:
     start_l, now_l = today_bounds_local(uid)
     r = (sb.table("hw_metrics").select("*")
@@ -90,15 +98,14 @@ def meals_today(uid: str) -> List[dict]:
 def _ctx_flags(uid: str) -> dict:
     """
     Inspect recent RAG context (chat, journal, meals) to set soft hints.
-    Only heuristics 	6 zero PII, just keywords.
+    Only heuristics — zero PII, just keywords.
     """
     try:
         ctx = retrieve_health_context(uid, "nudges", k=8) or []
-        # Concatenate any textual fields we may have
         txts = []
         for r in ctx:
             if isinstance(r, dict):
-                for k in ("text", "items"):
+                for k in ("text", "items", "blurb"):
                     v = r.get(k)
                     if isinstance(v, str):
                         txts.append(v)
@@ -206,11 +213,13 @@ async def busy_by_calendar(pf: dict, now_l: datetime) -> bool:
 
 # =================== Nudges ===================
 def _bucket(val: int, size: int) -> int:
-    # e.g., 1379 with size=500 -> 1500
     if val <= 0: return 0
     return int(round(val / size) * size)
 
-def build_nudges(uid: str) -> List[Dict]:
+def build_rule_nudges(uid: str) -> List[Dict]:
+    """
+    Original rules-based nudges (unchanged logic), returned as a list.
+    """
     pf = prefs(uid)
     tz = user_tz(uid)
     now_l = now_utc().astimezone(tz)
@@ -220,19 +229,19 @@ def build_nudges(uid: str) -> List[Dict]:
     anchors = rolling_7d_profile(uid)
     flags = _ctx_flags(uid)
 
+    nudges: List[Dict] = []
+
+    # Goals defaults
     kcal_goal  = int(pf.get("daily_calorie_goal") or 2000)
     steps_goal = int(pf.get("daily_step_goal")   or 8000)
     water_goal = int(pf.get("daily_water_ml")    or 2000)
     sleep_goal = int(pf.get("sleep_goal_min")    or 420)
 
-    nudges: List[Dict] = []
-
-    # Calories pacing (message uses exact, hash uses bucket)
+    # Calories pacing
     exp_frac = expected_fraction(now_l, anchors)
     exp_kcal = int(kcal_goal * exp_frac)
     actual_kcal = sum(int(m.get("calories") or 0) for m in meals)
     kcal_def = max(0, exp_kcal - actual_kcal)
-    # Skip kcal nudge if user context suggests fasting
     if (kcal_def >= 150) and (not ate_recently(meals)) and now_l.hour >= 11 and not flags.get("fasting"):
         nudges.append({
             "type": "kcal_pace",
@@ -261,7 +270,7 @@ def build_nudges(uid: str) -> List[Dict]:
             "hash_key": f"steps_pace|{_bucket(step_def, STEP_BUCKET)}"
         })
 
-    # Hydration blocks (9	619)
+    # Hydration blocks
     if 9 <= now_l.hour <= 19:
         blocks = ((now_l.hour - 9)*60 + now_l.minute)//90
         exp_water = int(min(10, max(0, blocks)) * (water_goal/10))
@@ -294,19 +303,16 @@ def build_nudges(uid: str) -> List[Dict]:
             "type": "mood_reset",
             "icon": "🌤️",
             "title": "Mental reset",
-            "msg": "Low mood 	6 2-min box breathing or a 5-min walk can help.",
+            "msg": "Low mood — try 2-min box breathing or a 5-min walk.",
             "hash_key": "mood_reset|1"
         })
 
-    # RAG-priority tweaks:
-    # (1) If dehydrated context, make water nudge first.
+    # RAG-priority tweaks
     if flags.get("dehydrated"):
         for i, n in enumerate(nudges):
             if n.get("type") == "water_pace":
                 nudges.insert(0, nudges.pop(i))
                 break
-
-    # (2) If stress context, insert a breathing micro-nudge first (once/day feel).
     if flags.get("stress") and 8 <= now_l.hour <= 22:
         if not any(n.get("type") == "breathing" for n in nudges):
             nudges.insert(0, {
@@ -317,20 +323,17 @@ def build_nudges(uid: str) -> List[Dict]:
                 "hash_key": "breathing|stress"
             })
 
-    # Default gentle touch (midday only) if still nothing
     if not nudges and 10 <= now_l.hour <= 18:
         nudges.append({
             "type": "breathing",
             "icon": "🌬️",
             "title": "60-second breathing",
-            "msg": "Inhale 4, hold 4, exhale 4, hold 4 	6 8 cycles.",
+            "msg": "Inhale 4, hold 4, exhale 4, hold 4 — 8 cycles.",
             "hash_key": "breathing|1"
         })
 
-    return nudges[:3] if nudges else [{
-        "type": "on_track", "icon":"✨","title":"On track","msg":"Nice work! Keep the streak going.",
-        "hash_key":"on_track|1"
-    }]
+    return nudges
+
 
 def nudges_hash(nudges: List[Dict]) -> str:
     blob = "".join(f"{n['hash_key']};" for n in nudges)
@@ -410,15 +413,48 @@ async def process_user(uid: str):
     if is_quiet_hours(uid, now_l, pf): return
     if await busy_by_calendar(pf, now_l): return
 
-    nudges = build_nudges(uid)
-    h = nudges_hash(nudges)
+    # ---------- Step 2: pull rich context for LLM ----------
+    ctx = retrieve_health_context(uid, "nudges", k=6) or []
+    snippets: List[str] = []
+    for r in ctx:
+        if isinstance(r, dict):
+            for k in ("text", "items", "blurb"):
+                v = r.get(k)
+                if isinstance(v, str):
+                    snippets.append(v)
 
-    # De-dup whole stack (content-bucket level)
+    # ---------- Step 3: blend LLM nudge + rules ----------
+    rule_nudges = build_rule_nudges(uid)
+
+    llm_msg = ""
+    try:
+        prof = profile(uid)
+        latest = latest_metrics_today(uid)
+        llm_msg = chat_nudge(prof, latest, snippets).strip()
+    except Exception as e:
+        log.info("LLM nudge failed (non-fatal): %s", e)
+        llm_msg = ""
+
+    nudges: List[Dict] = []
+    if llm_msg:
+        llm_hash = hashlib.sha256(llm_msg.encode("utf-8")).hexdigest()[:8]
+        nudges.append({
+            "type": "llm_nudge",
+            "icon": "✨",
+            "title": "Personal tip",
+            "msg": llm_msg,
+            "hash_key": f"llm_nudge|{llm_hash}",
+        })
+    nudges.extend(rule_nudges)
+    nudges = nudges[:3] if nudges else [{"type":"on_track","icon":"✨","title":"On track","msg":"Nice work! Keep the streak going.","hash_key":"on_track|1"}]
+
+    # ---------- Step 5: novelty control ----------
+    h = nudges_hash(nudges)
     last_h = pf.get("last_nudge_hash")
     if last_h == h:
         return
 
-    # Deliver the top nudge only, but respect short per-type cooldown
+    # Deliver the top nudge, respecting per-type cooldown (covers llm_nudge too)
     n = nudges[0]
     if sent_same_type_recently(uid, n.get("type",""), COOLDOWN_MIN_PER_TYPE):
         return
@@ -429,7 +465,6 @@ async def process_user(uid: str):
         text = f"{n.get('icon','✨')} *{n['title']}*\n{n['msg']}"
         await send_telegram(uid, text, pf, n, h)
 
-    # Remember last hash for cheap de-dup
     sb.table("hw_preferences").update({"last_nudge_hash": h}).eq("uid", uid).execute()
 
 # =================== Reactive event processor ===================
@@ -441,10 +476,7 @@ async def process_events():
         tz = user_tz(uid)
         now_l = now_utc().astimezone(tz)
 
-        if is_quiet_hours(uid, now_l, pf):
-            sb.table("hw_events").update({"processed": True}).eq("id", ev["id"]).execute()
-            continue
-        if await busy_by_calendar(pf, now_l):
+        if is_quiet_hours(uid, now_l, pf) or await busy_by_calendar(pf, now_l):
             sb.table("hw_events").update({"processed": True}).eq("id", ev["id"]).execute()
             continue
 

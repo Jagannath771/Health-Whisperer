@@ -19,7 +19,6 @@ def _get_api_key() -> str:
     return key
 
 def _get_base_url() -> Optional[str]:
-    # Let people override base URL if using a proxy
     if st is not None:
         return (st.secrets.get("openai") or {}).get("base_url") or os.getenv("OPENAI_BASE_URL")
     return os.getenv("OPENAI_BASE_URL")
@@ -34,9 +33,6 @@ def embed_text(text: str) -> List[float]:
     return out.data[0].embedding  # 1536-d
 
 # ---- Chat completions (text) ----
-# ---- Chat completions (text) ----
-# services/llm_openai.py
-
 def chat_text(system: str, user: str, **kwargs) -> str:
     client = _client()
     try:
@@ -49,8 +45,6 @@ def chat_text(system: str, user: str, **kwargs) -> str:
             **kwargs
         )
     except Exception as e:
-        # If the model rejects params like top_p / frequency_penalty,
-        # retry once with no extra kwargs.
         if "Unsupported parameter" in str(e) or "unsupported_parameter" in str(e):
             out = client.chat.completions.create(
                 model=OPENAI_CHAT_MODEL,
@@ -63,13 +57,8 @@ def chat_text(system: str, user: str, **kwargs) -> str:
             raise
     return (out.choices[0].message.content or "").strip()
 
-
-
-# ---- JSON helper (robust JSON backstop) ----
+# ---- JSON helper ----
 def chat_json(system: str, user: str) -> Dict[str, Any]:
-    """
-    Ask model to return JSON; fall back to best-effort parse if it returns text.
-    """
     import json
     client = _client()
     try:
@@ -85,10 +74,37 @@ def chat_json(system: str, user: str) -> Dict[str, Any]:
         return json.loads(raw)
     except Exception:
         try:
-            # Fallback: try to yank JSON substring
             start = raw.find("{"); end = raw.rfind("}")
             if start >= 0 and end > start:
                 return json.loads(raw[start:end+1])
         except Exception:
             pass
         return {}
+
+# ---- LLM nudge generator ----
+def chat_nudge(profile: dict, metrics: dict, history_snippets: List[str]) -> str:
+    system = (
+        "You are Health Whisperer, an empathetic multi-agent wellness coach "
+        "(physical activity, nutrition, mental health). You give brief, actionable, "
+        "supportive micro-nudges. Never diagnose; if serious symptoms appear, suggest "
+        "seeing a clinician. Respond in under 80 words total."
+    )
+
+    recent_context = " ".join([s for s in history_snippets if isinstance(s, str)])[:2000]
+
+    user = f"""
+    PROFILE:
+    {profile}
+
+    LATEST METRICS (today):
+    {metrics}
+
+    RECENT CONTEXT (journal/meals/chat blurbs):
+    {recent_context}
+
+    TASK:
+    Return 1–2 personalized, creative suggestions (bullet points or short lines).
+    Use emoji sparingly when it adds clarity (e.g., 💧 for hydration).
+    Prioritize safety, pacing (steps/kcal/water/sleep), and mood.
+    """
+    return chat_text(system, user)

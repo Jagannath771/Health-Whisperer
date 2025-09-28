@@ -1,6 +1,5 @@
 # pages/06c_Log_Nutrition.py
 import time
-import os
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
 import dotenv
@@ -50,16 +49,7 @@ if not is_authed:
 
 uid = st.session_state["sb_session"]["user_id"]
 access_token = st.session_state["sb_session"]["access_token"]
-
-# Build authed client (critical for RLS)
-sb = get_sb(access_token)
-
-# DEBUG: prove what PostgREST sees (comment out later)
-try:
-    who = sb.rpc("whoami").execute()
-    st.caption(f"whoami() reports: {who.data}")
-except Exception as e:
-    st.caption(f"whoami() failed: {e}")
+sb = get_sb(access_token)  # authed client for RLS
 
 def _user_tz(uid_: str) -> ZoneInfo:
     try:
@@ -93,7 +83,7 @@ def _load_today_meals(uid_: str) -> list[dict]:
     return r.data or []
 
 st.title("🍽️ Log Nutrition")
-st.caption("Free-text meals. Use “Parse with AI” to estimate macros, or save raw quickly.")
+st.caption("Free-text meals. Use “Parse with AI” to estimate macros, or save raw quickly (now vectorized for RAG).")
 
 bc, lc = st.columns(2)
 with bc:
@@ -117,36 +107,34 @@ save_raw = c1.button("💾 Save Raw (no AI)")
 parse_ai = c2.button("✨ Parse with AI (estimate & save)")
 
 def _save_raw_block(txt: str, when, meal_type: str):
+    """
+    IMPORTANT CHANGE:
+    Even for RAW saves we call `save_meal()` so rows include blurb + embedding,
+    making them retrievable by RAG immediately.
+    """
     if not txt:
         return
     when_u = _to_utc_from_local_time(when, uid) if when else datetime.now(timezone.utc)
-    payload = {
-        "uid": uid,  # MUST equal auth.uid()
-        "ts": when_u.isoformat(),
-        "meal_type": meal_type,  # breakfast/lunch/dinner/snacks
-        "items": txt,
-        "calories": None
-    }
-    exec_with_retry(sb.table("hw_meals").insert(payload))
+    parsed_min = {"items": [], "totals": {}}  # no macros, but build_blurb() will fall back to raw text
+    save_meal(uid, raw_text=txt, parsed=parsed_min, when_utc=when_u, meal_type=meal_type, access_token=access_token)
 
 def _ai_block(txt: str, when, meal_type: str):
     if not txt:
         return
     when_u = _to_utc_from_local_time(when, uid) if when else datetime.now(timezone.utc)
     parsed = estimate_meal(txt)
-    # run under authed user
     save_meal(uid, raw_text=txt, parsed=parsed, when_utc=when_u, meal_type=meal_type, access_token=access_token)
 
 if save_raw:
     for text, when, mt in [(b_txt, b_time, "breakfast"), (l_txt, l_time, "lunch"),
                            (d_txt, d_time, "dinner"), (s_txt, s_time, "snacks")]:
         _save_raw_block(text, when, mt)
-    st.success("Saved raw meals.")
+    st.success("Saved raw meals (vectorized).")
 elif parse_ai:
     for text, when, mt in [(b_txt, b_time, "breakfast"), (l_txt, l_time, "lunch"),
                            (d_txt, d_time, "dinner"), (s_txt, s_time, "snacks")]:
         _ai_block(text, when, mt)
-    st.success("Parsed & saved meals.")
+    st.success("Parsed & saved meals (vectorized).")
 
 st.divider()
 st.subheader("Today’s meals")
@@ -158,6 +146,6 @@ else:
     for m in meals:
         ts_local = datetime.fromisoformat(m["ts"].replace("Z","+00:00")).astimezone(tz).strftime("%b %d, %Y • %I:%M %p")
         kcal = m.get("calories")
-        st.markdown(f"**{m.get('meal_type','?').title()}** · {ts_local} — {f'{int(kcal)} kcal' if kcal else 'kcal unknown'}")
-        if m.get("items"):
-            st.caption(str(m["items"]))
+        st.markdown(f"**{m.get('meal_type','?').title()}** · {ts_local} — {f'{int(kcal)} kcal' if kcal is not None else 'kcal unknown'}")
+        if m.get("items"): st.caption(str(m["items"]))
+        if m.get("blurb"): st.caption(f"⃟ {m['blurb']}")

@@ -6,7 +6,6 @@ import streamlit as st
 from httpx import ReadError
 from postgrest.exceptions import APIError
 
-
 from supa import get_sb
 from nav import apply_global_ui, top_nav
 
@@ -32,7 +31,7 @@ if not is_authed:
 
 uid = st.session_state["sb_session"]["user_id"]
 access_token = st.session_state["sb_session"]["access_token"]
-sb = get_sb(access_token)  # <-- authed client
+sb = get_sb(access_token)  # authed client (RLS)
 
 # ---- Retry helper ----
 def exec_with_retry(req, tries: int = 3, base_delay: float = 0.4):
@@ -97,10 +96,12 @@ note = st.text_area("Short note (optional)", value=today_row.get("notes") or "",
                     placeholder="e.g., Morning run; sore calves; long sit today")
 
 if st.button("💾 Save Physical"):
+    now_u = datetime.now(timezone.utc)
     payload = {
         "uid": uid,
         "source": "manual",
         "log_date": _today(uid).isoformat(),
+        "ts": now_u.isoformat(),                 # <-- CRITICAL for worker/ bot visibility
         "steps": int(steps or 0),
         "sleep_minutes": int(sleep_min or 0),
         "heart_rate": int(heart_rate or 0),
@@ -109,10 +110,21 @@ if st.button("💾 Save Physical"):
         "notes": note or None,
     }
     try:
-        sb.table("hw_metrics").upsert(payload, on_conflict="uid,source,log_date").execute()
+        # upsert keeps one row per (uid, source, log_date) but refreshes ts and values
+        exec_with_retry(sb.table("hw_metrics").upsert(payload, on_conflict="uid,source,log_date"))
         st.success("Saved to today’s manual metrics.")
     except Exception:
         exec_with_retry(sb.table("hw_metrics").insert(payload))
         st.info("Saved as a new manual metrics row for today.")
+
+    # Fire a lightweight event so the nudge worker can react immediately
+    try:
+        exec_with_retry(sb.table("hw_events").insert({
+            "uid": uid,
+            "kind": "metrics_saved",
+            "payload": {"source": "manual", "steps": int(steps or 0)}
+        }))
+    except Exception:
+        pass
 
     today_row = _get_today_manual(uid)
