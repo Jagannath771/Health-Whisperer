@@ -12,15 +12,15 @@ from telegram.constants import ParseMode
 from icalendar import Calendar
 import httpx
 from services.memory import retrieve_health_context
-from services.llm_openai import chat_nudge  # <-- LLM nudge (Step 2/3/5)
+from services.llm_openai import chat_nudge  # LLM nudge
 
 # =================== Env & clients ===================
 load_dotenv()
 SUPABASE_URL   = os.getenv("SUPABASE_URL")
-SERVICE_KEY    = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+SERVICE_KEY    = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not (SUPABASE_URL and SERVICE_KEY and TELEGRAM_TOKEN):
-    raise RuntimeError("Missing SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, or TELEGRAM_TOKEN")
+    raise RuntimeError("Missing SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (or KEY), or TELEGRAM_TOKEN")
 
 sb  = create_client(SUPABASE_URL, SERVICE_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -218,7 +218,7 @@ def _bucket(val: int, size: int) -> int:
 
 def build_rule_nudges(uid: str) -> List[Dict]:
     """
-    Rules-based nudges (original logic kept) + NEW physical & mental signals.
+    Rules-based nudges (original logic kept) + physical & mental signals.
     """
     pf = prefs(uid)
     tz = user_tz(uid)
@@ -233,13 +233,13 @@ def build_rule_nudges(uid: str) -> List[Dict]:
 
     nudges: List[Dict] = []
 
-    # ---------- goals (unchanged defaults) ----------
+    # ---------- goals ----------
     kcal_goal  = int(pf.get("daily_calorie_goal") or 2000)
     steps_goal = int(pf.get("daily_step_goal")   or 8000)
     water_goal = int(pf.get("daily_water_ml")    or 2000)
     sleep_goal = int(pf.get("sleep_goal_min")    or 420)
 
-    # ---------- calories pacing (unchanged) ----------
+    # ---------- calories pacing ----------
     exp_frac   = expected_fraction(now_l, anchors)
     exp_kcal   = int(kcal_goal * exp_frac)
     actual_kcal = sum(int(m.get("calories") or 0) for m in meals)
@@ -253,7 +253,7 @@ def build_rule_nudges(uid: str) -> List[Dict]:
             "hash_key": f"kcal_pace|{_bucket(kcal_def, KCAL_BUCKET)}"
         })
 
-    # ---------- steps pacing (unchanged + injury wording tweak) ----------
+    # ---------- steps pacing ----------
     day_frac   = (now_l.hour + now_l.minute/60.0)/24.0
     exp_steps  = int(steps_goal * max(0.0, min(1.0, day_frac*1.05)))
     steps_now  = int(latest.get("steps") or 0)
@@ -272,7 +272,7 @@ def build_rule_nudges(uid: str) -> List[Dict]:
             "hash_key": f"steps_pace|{_bucket(step_def, STEP_BUCKET)}"
         })
 
-    # ---------- hydration blocks (unchanged) ----------
+    # ---------- hydration blocks ----------
     if 9 <= now_l.hour <= 19:
         blocks = ((now_l.hour - 9)*60 + now_l.minute)//90
         exp_water = int(min(10, max(0, blocks)) * (water_goal/10))
@@ -289,7 +289,7 @@ def build_rule_nudges(uid: str) -> List[Dict]:
             "hash_key": f"water_pace|{_bucket(water_def, WATER_BUCKET)}"
         })
 
-    # ---------- recovery/safety (unchanged) ----------
+    # ---------- recovery/safety ----------
     sleep_min = int(latest.get("sleep_minutes") or 0)
     if sleep_min and sleep_min < sleep_goal:
         nudges.append({
@@ -310,7 +310,7 @@ def build_rule_nudges(uid: str) -> List[Dict]:
         })
 
     # =========================================================
-    # NEW: Physical health signals (energy, pain, heart rate)
+    # Physical health signals (energy, pain, heart rate)
     # =========================================================
     energy = int(latest.get("energy_level") or 0)
     if energy and energy <= 2:
@@ -343,7 +343,7 @@ def build_rule_nudges(uid: str) -> List[Dict]:
         })
 
     # =========================================================
-    # NEW: Mental health signals (stress, anxiety, focus)
+    # Mental health signals (stress, anxiety, focus)
     # =========================================================
     stress = int(latest.get("stress_level") or 0)
     if stress and stress >= 4 and 7 <= now_l.hour <= 22:
@@ -375,7 +375,7 @@ def build_rule_nudges(uid: str) -> List[Dict]:
             "hash_key": "focus_boost|1"
         })
 
-    # ---------- RAG-priority tweaks (unchanged) ----------
+    # ---------- RAG-priority tweaks ----------
     if flags.get("dehydrated"):
         for i, n in enumerate(nudges):
             if n.get("type") == "water_pace":
@@ -391,7 +391,7 @@ def build_rule_nudges(uid: str) -> List[Dict]:
                 "hash_key": "breathing|stress"
             })
 
-    # ---------- safety fallback (unchanged) ----------
+    # ---------- safety fallback ----------
     if not nudges and 10 <= now_l.hour <= 18:
         nudges.append({
             "type": "breathing",
@@ -402,8 +402,6 @@ def build_rule_nudges(uid: str) -> List[Dict]:
         })
 
     return nudges
-
-
 
 def nudges_hash(nudges: List[Dict]) -> str:
     blob = "".join(f"{n['hash_key']};" for n in nudges)
@@ -496,27 +494,58 @@ async def process_user(uid: str):
     # ---------- Step 3: blend LLM nudge + rules ----------
     rule_nudges = build_rule_nudges(uid)
 
-    llm_msg = ""
+    llm_payload: Optional[Dict] = None
     try:
         prof = profile(uid)
         latest = latest_metrics_today(uid)
         llm_msg = chat_nudge(prof, latest, snippets).strip()
+        if llm_msg:
+            llm_payload = {
+                "type": "llm_nudge",
+                "icon": "✨",
+                "title": "Personal tip",
+                "msg": llm_msg,
+                "hash_key": f"llm_nudge|{hashlib.sha256(llm_msg.encode('utf-8')).hexdigest()[:8]}",
+            }
     except Exception as e:
         log.info("LLM nudge failed (non-fatal): %s", e)
-        llm_msg = ""
 
-    nudges: List[Dict] = []
-    if llm_msg:
-        llm_hash = hashlib.sha256(llm_msg.encode("utf-8")).hexdigest()[:8]
-        nudges.append({
-            "type": "llm_nudge",
-            "icon": "✨",
-            "title": "Personal tip",
-            "msg": llm_msg,
-            "hash_key": f"llm_nudge|{llm_hash}",
-        })
-    nudges.extend(rule_nudges)
-    nudges = nudges[:3] if nudges else [{"type":"on_track","icon":"✨","title":"On track","msg":"Nice work! Keep the streak going.","hash_key":"on_track|1"}]
+    # ---------- Diversity Composer (Option B) ----------
+    # Categorize rules
+    cats = {"steps":[], "water":[], "mental":[], "other":[]}
+    for n in rule_nudges:
+        t = n.get("type","")
+        if "step" in t:
+            cats["steps"].append(n)
+        elif "water" in t:
+            cats["water"].append(n)
+        elif any(x in t for x in ("mood","stress","anxiety","focus")):
+            cats["mental"].append(n)
+        else:
+            cats["other"].append(n)
+
+    # Construct up to 3 nudges with guaranteed variety:
+    # priority: steps → water → mental → llm → other
+    ordered: List[Dict] = []
+    if cats["steps"]:  ordered.append(cats["steps"][0])
+    if cats["water"]:  ordered.append(cats["water"][0])
+    if cats["mental"]: ordered.append(cats["mental"][0])
+
+    if llm_payload: ordered.append(llm_payload)
+
+    # Fill remainder (if any) from others, then leftover steps/water/mental
+    if len(ordered) < 3:
+        for pool in ("other", "steps", "water", "mental"):
+            for n in cats[pool]:
+                if n not in ordered:
+                    ordered.append(n)
+                    if len(ordered) >= 3: break
+            if len(ordered) >= 3: break
+
+    # Final cap / fallback
+    nudges = ordered[:3] if ordered else [{
+        "type":"on_track","icon":"✨","title":"On track","msg":"Nice work! Keep the streak going.","hash_key":"on_track|1"
+    }]
 
     # ---------- Step 5: novelty control ----------
     h = nudges_hash(nudges)
