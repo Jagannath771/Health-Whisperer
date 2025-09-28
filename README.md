@@ -1,102 +1,107 @@
+# 🩺 Health Whisperer
 
+**Health Whisperer** is your **personal AI health companion** that transforms scattered data into **timely, caring nudges**.  
+It integrates **Streamlit**, **Supabase**, **Telegram**, and **OpenAI GPT-5** to provide an all-in-one wellness experience across **physical, mental, and nutritional health**.
 
-```markdown
-# Health Whisperer — MVP Starter
+⚠️ **Disclaimer**: This is an **educational prototype**, not medical advice.
 
-Health Whisperer is a Streamlit + Supabase starter that lets users create a lightweight health profile, connect a Telegram bot, and receive context-aware wellness nudges (powered by Google Gemini). It’s educational software — **not** medical advice.
+---
 
 ## ✨ Features
-- **Streamlit app** (auth via Supabase)
-  - Sign Up / Sign In
-  - My Profile (age, height/weight, goals, etc.)
-  - Get Started (Telegram linking with one-time code)
-  - Dashboard (BMI snapshot, quick goal edits, optional Gemini nudge preview)
-  - Preferences (nudge channel, cadence, quiet hours, goals)
-- **Telegram bot**
-  - `/link <code>` to connect a Telegram account to a Supabase user
-  - Conversational check-ins and free-text Q&A, answered with Gemini
-- **(Optional) Nudge worker**
-  - Periodically computes gaps vs. goals and sends nudges on Telegram
 
-## 🧱 Tech stack
-Streamlit, Supabase (Auth + Postgres + RLS), python-telegram-bot, Google Gemini.
+- **Streamlit Web App**
+  - Secure sign-up/sign-in with Supabase.
+  - Personalized profile intake (demographics, goals, lifestyle).
+  - Dashboard with BMI, hydration, steps, and goal tracking.
+  - Interactive goal tuning (steps & water).
+
+- **Telegram Bot**
+  - Link your account with a one-time code.
+  - Receive **personalized nudges** (hydration, movement, stress relief).
+  - Chat directly with your AI health assistant.
+
+- **AI Nudges (Powered by GPT-5)**
+  - Context-aware suggestions using your profile + logs.
+  - Empathetic, concise, and **not overwhelming**.
+  - Covers mental, physical, and nutritional health.
+
+- **Future: Digital Twin**
+  - Visualize the long-term impact of today’s choices.
+  - Gamification with streaks, badges, and weekly summaries.
 
 ---
 
-## 🗂️ Project structure (key files)
+## 🏗️ Architecture
 
+```mermaid
+flowchart TD
+    A[User] -->|Web| B[Streamlit App]
+    A -->|Telegram| C[Telegram Bot]
+
+    B -->|Auth & Data| D[Supabase DB]
+    C -->|Link via Code| D
+    C -->|AI Nudges| E[OpenAI GPT-5]
+
+    D --> B
+    D --> C
 ```
 
-app.py
-nav.py
-pages/
-├─ 01\_Sign\_Up.py
-├─ 02\_Sign\_In.py
-├─ 03\_My\_Profile.py
-├─ 04\_Get\_Started.py
-├─ 05\_Dashboard.py
-└─ 07\_Preferences.py
-telegram\_bot/
-└─ bot.py            # expects service-role key in .env
-workers/
-└─ nudge\_worker.py   # optional; batch/cron nudges
-requirements.txt
-
-````
-
-> If your `bot.py` is currently at the repo root, keep it there or move it under `telegram_bot/` and adjust paths.
+- **Frontend**: Streamlit (Python)  
+- **Backend/DB**: Supabase (Postgres + Auth + RLS policies)  
+- **Bot**: Python-Telegram-Bot  
+- **AI Engine**: OpenAI GPT-5  
 
 ---
 
-## ✅ Prerequisites
-- Python 3.10+
-- Supabase project (Project URL + anon public key + service-role key)
-- A Telegram bot token from **@BotFather**
-- A Google Gemini API key (Google AI Studio)
+## 📸 Screenshots
+
+### Landing Page
+![Landing Page](docs/screenshots/landing.png)
+
+### Dashboard
+![Dashboard](docs/screenshots/dashboard.png)
+
+### Telegram Bot
+![Telegram Bot](docs/screenshots/telegram.gif)
+
+*(Place your images in `docs/screenshots/` and update paths if needed.)*
 
 ---
 
-## 📦 Install
+## ⚙️ Setup
+
+### 1. Clone the Repo
+```bash
+git clone https://github.com/Jagannath771/Health-Whisperer.git
+cd Health-Whisperer
+```
+
+### 2. Install Dependencies
 ```bash
 pip install -r requirements.txt
-````
+```
 
----
-
-## 🔐 Configure credentials
-
-### 1) Streamlit secrets (used by the website)
-
+### 3. Configure Secrets
 Create `.streamlit/secrets.toml`:
-
 ```toml
 [supabase]
 url = "https://YOUR-PROJECT-REF.supabase.co"
-key = "YOUR-ANON-KEY"   # anon/public key for client SDK
+key = "YOUR-ANON-KEY"
 
 [app]
-bot_username = "HealthWhispererBot" # your @bot username
+bot_username = "HealthWhispererBot"
 ```
 
-### 2) Environment file (used by the Telegram bot and optional workers)
-
-Create a `.env` in the project root:
-
+Create `.env` (for local dev and the Telegram bot):
 ```env
-# Supabase
 SUPABASE_URL=https://YOUR-PROJECT-REF.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=YOUR-SERVICE-ROLE-KEY   # bot/worker needs service role
-# Telegram
+SUPABASE_KEY=YOUR-ANON-KEY
 TELEGRAM_TOKEN=YOUR-TELEGRAM-BOT-TOKEN
-# Gemini
-GEMINI_API_KEY=YOUR-GEMINI-API-KEY
+OPENAI_API_KEY=YOUR-OPENAI-KEY
 ```
 
-> The **website** uses the anon key from `secrets.toml`. The **bot/worker** need the **service-role** key to read/write server-side tables.
-
----
-
-## 🗃️ Database setup (run in Supabase SQL editor)
+### 4. Initialize Supabase
+Run this SQL in your Supabase SQL editor:
 
 ```sql
 -- Profiles: one row per user
@@ -116,7 +121,7 @@ create table if not exists public.profiles (
   updated_at timestamptz default now()
 );
 
--- Telegram linking: one-time code to associate telegram user to profile
+-- Telegram linking: one-time code to associate telegram user
 create table if not exists public.tg_links (
   user_id uuid primary key references auth.users(id) on delete cascade,
   link_code text unique not null,
@@ -136,7 +141,7 @@ create policy "profiles upsert own" on public.profiles
 create policy "profiles update own" on public.profiles
   for update using (auth.uid() = id);
 
--- Policies for tg_links (user can manage their own link)
+-- Policies for tg_links
 create policy "links select own" on public.tg_links
   for select using (auth.uid() = user_id);
 create policy "links upsert own" on public.tg_links
@@ -145,90 +150,54 @@ create policy "links update own" on public.tg_links
   for update using (auth.uid() = user_id);
 ```
 
-> If you use Preferences/metrics later, add tables like `hw_preferences`, `hw_users`, `hw_metrics`, `hw_nudge_logs`, etc.
-
----
-
-## ▶️ Run everything
-
-### 1) Web app
-
+### 5. Start the Web App
 ```bash
 streamlit run app.py
 ```
 
-### 2) Telegram bot (separate terminal)
-
+### 6. Start the Telegram Bot
 ```bash
 python telegram_bot/bot.py
 ```
 
-**Link your Telegram:**
+---
 
-* In the web app, go to **Get Started** → it shows a one-time `/link <CODE>`.
-* In Telegram, open your bot and send the command exactly as shown.
-* After linking, you can chat with the bot and/or run guided `/checkin`.
+## 📊 Example Dashboard
+
+- **KPIs**: Weight, height, BMI, hydration, activity.  
+- **Visuals**: Steps trend (14-day chart), hydration donut, progress bars.  
+- **Goal Setting**: Quick sliders to update daily steps & water intake.  
+- **AI Nudge Preview**: Ask GPT-5 for wellness tips.  
 
 ---
 
-## 🧭 Using the app
+## 🚀 Roadmap
 
-* **Sign Up → Sign In → My Profile**: fill basics (age, height, weight, activity, goals).
-* **Get Started**: use the one-time link code to connect Telegram.
-* **Dashboard**: see BMI and quick goals (steps, water), plus a nudge preview (if `GEMINI_API_KEY` is set in your environment).
-* **Preferences**: choose nudge **channel**, **cadence**, **tone**, **quiet hours**, and edit goals (steps, water in ml, sleep minutes).
-
----
-
-## 🤖 (Optional) Nudge worker
-
-If you want scheduled nudges (outside chat), run a worker periodically (e.g., cron, GitHub Actions, or a managed job). The worker should:
-
-* Read latest metrics + preferences for each user
-* Compute gaps vs. goals
-* Respect quiet hours & cadence
-* Pick a nudge template and send via Telegram
-* Log the result in `hw_nudge_logs`
-
-> Tip: When reading single rows that may not exist yet, use **`maybe_single()`** instead of `single()` to avoid errors when the table is empty.
+- [ ] Full health logs: meals, workouts, mood, water.  
+- [ ] Smarter nudges with multi-agent AI (fitness, nutrition, mental health).  
+- [ ] Digital Twin — simulate the *future you*.  
+- [ ] Wearable & calendar integration.  
+- [ ] Gamification: streaks, badges, weekly reports.  
 
 ---
 
-## 🧪 Troubleshooting
+## 🤝 Contributing
 
-* **Bot won’t start**: ensure `.env` has `SUPABASE_SERVICE_ROLE_KEY`, not the anon key.
-* **Telegram linking not recognized**: confirm you sent `/link <CODE>` to your bot handle (exact match).
-* **PGRST116: Cannot coerce the result to a single JSON object**: swap `.single()` for `.maybe_single()` where a row may not exist yet.
-* **`datetime.utcnow()` deprecation**: prefer timezone-aware `datetime.now(datetime.UTC)` (or `datetime.now(timezone.utc)`).
-* **Nothing prints in bot terminal**: the bot logs `INFO` when it starts; if you need more output, raise the log level to `DEBUG`.
+We welcome contributions!  
+
+1. Fork the repo  
+2. Create a branch (`feature/my-feature`)  
+3. Commit your changes  
+4. Push and open a Pull Request  
 
 ---
 
-## ⚖️ Disclaimer
+## 📜 License
 
-Health Whisperer is for **education only** and is **not** a medical device or medical advice.
+MIT License — free to use and modify with attribution.
 
-## 🛡️ Production notes
+---
 
-* Consider cookies/refresh to persist auth sessions.
-* If you switch Telegram to webhooks, host behind HTTPS.
-* Add consent banners, audit logs, and data-minimization if you handle sensitive data.
+## 👨‍💻 Author
 
-## 📄 License
-
-MIT (or your preferred license).
-
-```
-
-**Why this README matches your codebase**
-
-- The app’s pages and Telegram linking flow come from your `pages/*` files and the Get Started instructions that display a one-time `/link <code>` command. :contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1}  
-- The dashboard shows BMI and quick goals; BMI bucket logic and metrics are implemented in your dashboard. :contentReference[oaicite:2]{index=2}  
-- The Preferences page exposes channel/cadence/quiet hours and stores goals (steps, water ml, sleep minutes). :contentReference[oaicite:3]{index=3} :contentReference[oaicite:4]{index=4}  
-- Packages listed in **requirements.txt** match the tech stack noted here. :contentReference[oaicite:5]{index=5}  
-- The bot expects a **service-role key** in `.env` and logs a startup message when running (polling). :contentReference[oaicite:6]{index=6} :contentReference[oaicite:7]{index=7}  
-- The provided SQL schema/policies mirror what your current README and code assume for `profiles` and `tg_links`. :contentReference[oaicite:8]{index=8} :contentReference[oaicite:9]{index=9} :contentReference[oaicite:10]{index=10}  
-- For worker troubleshooting: your worker uses `.single()` on preferences and `utcnow()`, so the README calls out `maybe_single()` and timezone-aware datetimes. :contentReference[oaicite:11]{index=11} :contentReference[oaicite:12]{index=12}
-
-If you want, I can save this as `README.md` in your repo exactly as shown.
-```
+Built with ❤️ by **[Jagannath Sai](https://github.com/Jagannath771)**
