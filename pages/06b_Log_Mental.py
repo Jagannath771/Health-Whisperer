@@ -11,6 +11,10 @@ from services.llm_openai import embed_text
 from nav import apply_global_ui, top_nav
 
 apply_global_ui()
+
+is_authed = "sb_session" in st.session_state
+top_nav(is_authed=is_authed, current="LogMental")
+
 st.set_page_config(page_title="Log Mental - Health Whisperer",
                    layout="wide",
                    initial_sidebar_state="collapsed")
@@ -27,8 +31,7 @@ def on_sign_out(sb=None):
     finally:
         st.session_state.pop("sb_session", None)
 
-is_authed = "sb_session" in st.session_state
-top_nav(is_authed, on_sign_out, current="Log Mental")
+
 if not is_authed:
     st.warning("Please sign in first.")
     st.switch_page("pages/02_Sign_In.py")

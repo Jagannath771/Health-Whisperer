@@ -13,6 +13,10 @@ from supa import get_sb
 from nav import apply_global_ui, top_nav
 
 apply_global_ui()
+
+is_authed = "sb_session" in st.session_state
+top_nav(is_authed=is_authed, current="LogNutrition")
+
 st.set_page_config(page_title="Log Nutrition - Health Whisperer",
                    layout="wide",
                    initial_sidebar_state="collapsed")
@@ -40,8 +44,7 @@ def on_sign_out():
     get_sb().auth.sign_out()
     st.session_state.pop("sb_session", None)
 
-is_authed = "sb_session" in st.session_state
-top_nav(is_authed, on_sign_out, current="Log Nutrition")
+
 if not is_authed:
     st.warning("Please sign in first.")
     st.switch_page("pages/02_Sign_In.py")
