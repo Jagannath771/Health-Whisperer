@@ -62,7 +62,11 @@ flowchart TD
 ![Dashboard](docs/screenshots/dashboard.png)
 
 ### Telegram Bot
-![Telegram Bot](docs/screenshots/telegram.gif)
+![Telegram Bot Screenshot 1](docs/screenshots/image.png)
+![Telegram Bot Screenshot 2](docs/screenshots/image1.png)
+![Telegram Bot Screenshot 3](docs/screenshots/image2.png)
+
+
 
 *(Place your images in `docs/screenshots/` and update paths if needed.)*
 
