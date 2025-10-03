@@ -6,6 +6,9 @@ from postgrest.exceptions import APIError
 from nav import apply_global_ui, top_nav
 
 apply_global_ui()
+
+is_authed = "sb_session" in st.session_state
+top_nav(is_authed=is_authed, current="Home")
 from supa import get_sb
 
 st.set_page_config(page_title="My Profile - Health Whisperer",
@@ -20,8 +23,7 @@ def on_sign_out(sb=None):
     finally:
         st.session_state.pop("sb_session", None)
 
-is_authed = "sb_session" in st.session_state
-top_nav(is_authed, on_sign_out, current="My Profile")
+
 if not is_authed:
     st.warning("Please sign in first.")
     st.switch_page("pages/02_Sign_In.py")
